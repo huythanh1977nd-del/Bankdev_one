@@ -1,24 +1,14 @@
-import os
+from flask import Flask, request, jsonify
 import sqlite3
 import secrets
-import string
-from flask import Flask, request, jsonify
+from datetime import datetime, timezone
+from functools import wraps
+import os
 
 app = Flask(__name__)
 
-# ============================================================
-# CẤU HÌNH
-# ============================================================
+DATABASE = os.environ.get("DATABASE_PATH", "bank.db")
 
-DATABASE = "bankdev.db"
-
-# STK đầu tiên
-START_ACCOUNT = 3212215014760
-
-
-# ============================================================
-# DATABASE
-# ============================================================
 
 def get_db():
     conn = sqlite3.connect(DATABASE)
@@ -26,276 +16,261 @@ def get_db():
     return conn
 
 
-def init_database():
+def init_db():
     conn = get_db()
-
     conn.execute("""
         CREATE TABLE IF NOT EXISTS accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account TEXT UNIQUE NOT NULL,
+            account_number TEXT UNIQUE NOT NULL,
             api_key TEXT UNIQUE NOT NULL,
-            balance INTEGER DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            balance INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
         )
     """)
-
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            transaction_id TEXT UNIQUE NOT NULL,
+            account_number TEXT NOT NULL,
+            transaction_type TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            balance_after INTEGER NOT NULL,
+            description TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
 
 
-# ============================================================
-# TẠO API KEY
-# ============================================================
+def now_utc():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def generate_account_number():
+    while True:
+        number = str(secrets.randbelow(900000000000) + 100000000000)
+        conn = get_db()
+        exists = conn.execute(
+            "SELECT 1 FROM accounts WHERE account_number = ?", (number,)
+        ).fetchone()
+        conn.close()
+        if not exists:
+            return number
+
 
 def generate_api_key():
-    characters = string.ascii_letters + string.digits
-
-    random_part = ''.join(
-        secrets.choice(characters)
-        for _ in range(32)
-    )
-
-    return "bdk_" + random_part
+    return "sk_live_" + secrets.token_urlsafe(32)
 
 
-# ============================================================
-# TẠO SỐ TÀI KHOẢN TIẾP THEO
-# ============================================================
+def require_api_key(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        api_key = request.headers.get("X-API-Key")
+        if not api_key:
+            return jsonify({
+                "status": "error",
+                "message": "Missing X-API-Key header"
+            }), 401
 
-def generate_next_account():
-    conn = get_db()
+        conn = get_db()
+        account = conn.execute(
+            "SELECT * FROM accounts WHERE api_key = ?", (api_key,)
+        ).fetchone()
+        conn.close()
 
-    row = conn.execute("""
-        SELECT account
-        FROM accounts
-        ORDER BY id DESC
-        LIMIT 1
-    """).fetchone()
+        if not account:
+            return jsonify({
+                "status": "error",
+                "message": "Invalid API Key"
+            }), 401
 
-    if row is None:
-        account_number = START_ACCOUNT
-    else:
-        account_number = int(row["account"]) + 1
+        return func(account, *args, **kwargs)
+    return wrapper
 
-    conn.close()
-
-    # Kiểm tra đúng 13 số
-    if len(str(account_number)) != 13:
-        raise ValueError("Số tài khoản đã vượt quá 13 chữ số")
-
-    return str(account_number)
-
-
-# ============================================================
-# TRANG CHỦ
-# ============================================================
 
 @app.get("/")
 def home():
     return jsonify({
+        "name": "Bank Dev API",
+        "version": "1.0.0",
         "status": "online",
-        "service": "Bank Dev",
-        "version": "1.0",
-        "message": "Bank Dev API is running"
+        "message": "Demo API for development/testing only"
     })
 
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
-@app.get("/health")
-def health():
-    return jsonify({
-        "status": "ok"
-    })
-
-
-# ============================================================
-# ĐĂNG KÝ TÀI KHOẢN
-# ============================================================
 
 @app.post("/api/register")
 def register():
+    account_number = generate_account_number()
+    api_key = generate_api_key()
+    created_at = now_utc()
+
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO accounts
+        (account_number, api_key, balance, created_at)
+        VALUES (?, ?, 0, ?)
+    """, (account_number, api_key, created_at))
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "status": "success",
+        "message": "Account created",
+        "account_number": account_number,
+        "api_key": api_key,
+        "balance": 0,
+        "created_at": created_at
+    }), 201
+
+
+@app.post("/api/deposit")
+@require_api_key
+def deposit(account):
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({
+            "status": "error",
+            "message": "JSON body is required"
+        }), 400
+
+    amount = data.get("amount")
+    description = data.get("description", "Nạp tiền")
 
     try:
-        account = generate_next_account()
-        api_key = generate_api_key()
+        amount = int(amount)
+    except (TypeError, ValueError):
+        return jsonify({
+            "status": "error",
+            "message": "amount must be an integer"
+        }), 400
 
-        conn = get_db()
+    if amount <= 0:
+        return jsonify({
+            "status": "error",
+            "message": "amount must be greater than 0"
+        }), 400
+
+    transaction_id = (
+        "TX"
+        + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        + secrets.token_hex(4).upper()
+    )
+    created_at = now_utc()
+
+    conn = get_db()
+    try:
+        # SQLite transaction keeps balance update + transaction record together.
+        conn.execute("BEGIN IMMEDIATE")
+
+        row = conn.execute(
+            "SELECT balance FROM accounts WHERE account_number = ?",
+            (account["account_number"],)
+        ).fetchone()
+
+        if row is None:
+            conn.rollback()
+            return jsonify({
+                "status": "error",
+                "message": "Account not found"
+            }), 404
+
+        current_balance = row["balance"]
+        new_balance = current_balance + amount
+
+        conn.execute(
+            "UPDATE accounts SET balance = ? WHERE account_number = ?",
+            (new_balance, account["account_number"])
+        )
 
         conn.execute("""
-            INSERT INTO accounts
-            (account, api_key, balance)
-            VALUES (?, ?, ?)
+            INSERT INTO transactions
+            (transaction_id, account_number, transaction_type,
+             amount, balance_after, description, created_at)
+            VALUES (?, ?, 'DEPOSIT', ?, ?, ?, ?)
         """, (
-            account,
-            api_key,
-            0
+            transaction_id,
+            account["account_number"],
+            amount,
+            new_balance,
+            str(description),
+            created_at
         ))
 
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         conn.close()
-
-        print("=" * 60)
-        print("TÀI KHOẢN MỚI ĐƯỢC CẤP")
-        print("Số tài khoản:", account)
-        print("API Key:", api_key)
-        print("Số dư:", 0)
-        print("=" * 60)
-
-        return jsonify({
-            "status": "success",
-            "message": "Account created successfully",
-            "account": account,
-            "api_key": api_key,
-            "balance": 0
-        }), 201
-
-    except Exception as e:
-
-        print("REGISTER ERROR:", str(e))
-
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
-
-
-# ============================================================
-# KIỂM TRA TÀI KHOẢN
-# ============================================================
-
-@app.get("/api/account/<account>")
-def get_account(account):
-
-    conn = get_db()
-
-    row = conn.execute("""
-        SELECT account, balance, created_at
-        FROM accounts
-        WHERE account = ?
-    """, (account,)).fetchone()
-
-    conn.close()
-
-    if row is None:
-        return jsonify({
-            "status": "error",
-            "message": "Account not found"
-        }), 404
 
     return jsonify({
         "status": "success",
-        "account": row["account"],
-        "balance": row["balance"],
-        "created_at": row["created_at"]
+        "transaction_id": transaction_id,
+        "account_number": account["account_number"],
+        "transaction_type": "DEPOSIT",
+        "amount": amount,
+        "balance": new_balance,
+        "description": description,
+        "created_at": created_at
     })
 
 
-# ============================================================
-# KIỂM TRA API KEY
-# ============================================================
-
-@app.get("/api/verify")
-def verify_api_key():
-
-    api_key = request.headers.get("X-API-Key")
-
-    if not api_key:
-        return jsonify({
-            "status": "error",
-            "message": "Missing X-API-Key"
-        }), 401
-
+@app.get("/api/balance")
+@require_api_key
+def balance(account):
     conn = get_db()
-
-    row = conn.execute("""
-        SELECT account, balance
-        FROM accounts
-        WHERE api_key = ?
-    """, (api_key,)).fetchone()
-
+    row = conn.execute(
+        "SELECT balance FROM accounts WHERE account_number = ?",
+        (account["account_number"],)
+    ).fetchone()
     conn.close()
-
-    if row is None:
-        return jsonify({
-            "status": "error",
-            "message": "Invalid API Key"
-        }), 401
 
     return jsonify({
         "status": "success",
-        "message": "API Key is valid",
-        "account": row["account"],
+        "account_number": account["account_number"],
         "balance": row["balance"]
     })
 
 
-# ============================================================
-# XEM DANH SÁCH TÀI KHOẢN
-# ============================================================
-
-@app.get("/api/accounts")
-def list_accounts():
-
+@app.get("/api/transactions")
+@require_api_key
+def transactions(account):
     conn = get_db()
-
     rows = conn.execute("""
-        SELECT
-            id,
-            account,
-            balance,
-            created_at
-        FROM accounts
-        ORDER BY id ASC
-    """).fetchall()
-
+        SELECT transaction_id, transaction_type, amount,
+               balance_after, description, created_at
+        FROM transactions
+        WHERE account_number = ?
+        ORDER BY id DESC
+    """, (account["account_number"],)).fetchall()
     conn.close()
-
-    accounts = []
-
-    for row in rows:
-        accounts.append({
-            "id": row["id"],
-            "account": row["account"],
-            "balance": row["balance"],
-            "created_at": row["created_at"]
-        })
 
     return jsonify({
         "status": "success",
-        "total": len(accounts),
-        "accounts": accounts
+        "account_number": account["account_number"],
+        "transactions": [dict(row) for row in rows]
     })
 
 
-# ============================================================
-# KHỞI TẠO DATABASE
-# ============================================================
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({
+        "status": "error",
+        "message": "Endpoint not found"
+    }), 404
 
-init_database()
+
+@app.errorhandler(405)
+def method_not_allowed(error):
+    return jsonify({
+        "status": "error",
+        "message": "HTTP method not allowed"
+    }), 405
 
 
-# ============================================================
-# CHẠY SERVER
-# ============================================================
+init_db()
 
 if __name__ == "__main__":
-
-    port = int(os.environ.get("PORT", 10000))
-
-    print("=" * 60)
-    print("BANK DEV SERVER")
-    print("Server đang chạy...")
-    print("PORT:", port)
-    print("Database:", DATABASE)
-    print("STK bắt đầu:", START_ACCOUNT)
-    print("=" * 60)
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False
-    )
-
+    # Local development only. Render uses the Procfile/Waitress command.
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
