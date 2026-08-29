@@ -13,7 +13,7 @@ app = Flask(__name__)
 DATABASE = "bankdev.db"
 
 # STK đầu tiên
-START_ACCOUNT = 3212215014761
+START_ACCOUNT = 3212215014760
 
 
 # ============================================================
