@@ -7,6 +7,8 @@ Demo API nạp tiền dùng Flask + SQLite + Waitress.
 - GET `/`
 - POST `/api/register`
 - POST `/api/deposit`
+- POST `/api/withdraw`
+- POST `/api/transfer`
 - GET `/api/balance`
 - GET `/api/transactions`
 
