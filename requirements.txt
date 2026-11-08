@@ -1,2 +1,4 @@
-Flask>=3.0,<4
-waitress>=3.0,<4
+Flask
+requests
+waitress
+
