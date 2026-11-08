@@ -1,13 +1,45 @@
-from flask import Flask, request, jsonify
-import sqlite3
+import os
+import time
 import secrets
+import sqlite3
+import threading
+import requests
+
 from datetime import datetime, timezone
 from functools import wraps
-import os
+from flask import Flask, request, jsonify
+
+
+# ============================================================
+# BANKDEV ONE - CONFIGURATION
+# ============================================================
 
 app = Flask(__name__)
 
 DATABASE = os.environ.get("DATABASE_PATH", "bank.db")
+
+PROGRAM_NAME = "BANKDEV ONE"
+PROGRAM_VERSION = "2.0.0"
+
+
+# ============================================================
+# ACB ONE CONNECT - OAUTH CONFIGURATION
+# ============================================================
+
+ACB_CLIENT_ID = os.environ.get("ACB_CLIENT_ID", "").strip()
+ACB_CLIENT_SECRET = os.environ.get("ACB_CLIENT_SECRET", "").strip()
+ACB_TOKEN_URL = os.environ.get("ACB_TOKEN_URL", "").strip()
+
+# body = client_id/client_secret trong form body
+# basic = HTTP Basic Authentication
+ACB_TOKEN_AUTH_METHOD = os.environ.get(
+    "ACB_TOKEN_AUTH_METHOD", "body"
+).strip().lower()
+
+ACB_ACCESS_TOKEN = None
+ACB_TOKEN_EXPIRES_AT = 0
+
+ACB_TOKEN_LOCK = threading.Lock()
 
 
 # ============================================================
@@ -15,34 +47,56 @@ DATABASE = os.environ.get("DATABASE_PATH", "bank.db")
 # ============================================================
 
 def get_db():
-    conn = sqlite3.connect(DATABASE)
+
+    conn = sqlite3.connect(
+        DATABASE,
+        timeout=30
+    )
+
     conn.row_factory = sqlite3.Row
+
     return conn
 
 
 def init_db():
+
     conn = get_db()
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS accounts (
+
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+
             account_number TEXT UNIQUE NOT NULL,
+
             api_key TEXT UNIQUE NOT NULL,
+
             balance INTEGER NOT NULL DEFAULT 0,
+
             created_at TEXT NOT NULL
+
         )
     """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
+
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+
             transaction_id TEXT UNIQUE NOT NULL,
+
             account_number TEXT NOT NULL,
+
             transaction_type TEXT NOT NULL,
+
             amount INTEGER NOT NULL,
+
             balance_after INTEGER NOT NULL,
+
             description TEXT,
+
             created_at TEXT NOT NULL
+
         )
     """)
 
@@ -55,10 +109,12 @@ def init_db():
 # ============================================================
 
 def now_utc():
+
     return datetime.now(timezone.utc).isoformat()
 
 
 def generate_transaction_id(prefix="TX"):
+
     return (
         prefix
         + datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
@@ -67,7 +123,9 @@ def generate_transaction_id(prefix="TX"):
 
 
 def generate_account_number():
+
     while True:
+
         number = str(
             secrets.randbelow(900000000000) + 100000000000
         )
@@ -75,7 +133,11 @@ def generate_account_number():
         conn = get_db()
 
         exists = conn.execute(
-            "SELECT 1 FROM accounts WHERE account_number = ?",
+            """
+            SELECT 1
+            FROM accounts
+            WHERE account_number = ?
+            """,
             (number,)
         ).fetchone()
 
@@ -86,6 +148,7 @@ def generate_account_number():
 
 
 def generate_api_key():
+
     return "sk_live_" + secrets.token_urlsafe(32)
 
 
@@ -101,6 +164,7 @@ def require_api_key(func):
         api_key = request.headers.get("X-API-Key")
 
         if not api_key:
+
             return jsonify({
                 "status": "error",
                 "message": "Missing X-API-Key header"
@@ -109,13 +173,18 @@ def require_api_key(func):
         conn = get_db()
 
         account = conn.execute(
-            "SELECT * FROM accounts WHERE api_key = ?",
+            """
+            SELECT *
+            FROM accounts
+            WHERE api_key = ?
+            """,
             (api_key,)
         ).fetchone()
 
         conn.close()
 
         if not account:
+
             return jsonify({
                 "status": "error",
                 "message": "Invalid API Key"
@@ -127,6 +196,169 @@ def require_api_key(func):
 
 
 # ============================================================
+# ACB AUTOMATIC OAUTH TOKEN
+# ============================================================
+
+def get_acb_access_token(force_refresh=False):
+
+    global ACB_ACCESS_TOKEN
+    global ACB_TOKEN_EXPIRES_AT
+
+    with ACB_TOKEN_LOCK:
+
+        current_time = time.monotonic()
+
+        # Reuse existing token
+        if (
+            not force_refresh
+            and ACB_ACCESS_TOKEN
+            and current_time < ACB_TOKEN_EXPIRES_AT - 60
+        ):
+
+            return ACB_ACCESS_TOKEN
+
+        # Check configuration
+        if not ACB_CLIENT_ID:
+
+            raise RuntimeError("Missing ACB_CLIENT_ID")
+
+        if not ACB_CLIENT_SECRET:
+
+            raise RuntimeError("Missing ACB_CLIENT_SECRET")
+
+        if not ACB_TOKEN_URL:
+
+            raise RuntimeError("Missing ACB_TOKEN_URL")
+
+        if ACB_TOKEN_AUTH_METHOD not in ("body", "basic"):
+
+            raise RuntimeError(
+                "ACB_TOKEN_AUTH_METHOD must be body or basic"
+            )
+
+        # OAuth form
+        payload = {
+            "grant_type": "client_credentials"
+        }
+
+        if ACB_TOKEN_AUTH_METHOD == "body":
+
+            payload["client_id"] = ACB_CLIENT_ID
+            payload["client_secret"] = ACB_CLIENT_SECRET
+
+            auth = None
+
+        else:
+
+            auth = (
+                ACB_CLIENT_ID,
+                ACB_CLIENT_SECRET
+            )
+
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json"
+        }
+
+        try:
+
+            response = requests.post(
+                ACB_TOKEN_URL,
+                data=payload,
+                headers=headers,
+                auth=auth,
+                timeout=30
+            )
+
+            if not response.ok:
+
+                print(
+                    "ACB OAuth HTTP error:",
+                    response.status_code
+                )
+
+                # Do not expose credentials or token
+                raise RuntimeError(
+                    f"ACB OAuth returned HTTP {response.status_code}"
+                )
+
+            result = response.json()
+
+            access_token = result.get("access_token")
+
+            if not access_token:
+
+                raise RuntimeError(
+                    "ACB response does not contain access_token"
+                )
+
+            expires_in = result.get("expires_in", 300)
+
+            try:
+
+                expires_in = max(1, int(expires_in))
+
+            except (TypeError, ValueError):
+
+                expires_in = 300
+
+            # Save token in memory
+            ACB_ACCESS_TOKEN = access_token
+
+            ACB_TOKEN_EXPIRES_AT = (
+                time.monotonic() + expires_in
+            )
+
+            print("===================================")
+            print("BANKDEV ONE - ACB OAUTH")
+            print("Token status: SUCCESS")
+            print("Token obtained automatically")
+            print("Expires in:", expires_in, "seconds")
+            print("===================================")
+
+            return ACB_ACCESS_TOKEN
+
+        except requests.exceptions.RequestException as error:
+
+            ACB_ACCESS_TOKEN = None
+            ACB_TOKEN_EXPIRES_AT = 0
+
+            raise RuntimeError(
+                f"ACB connection failed: {type(error).__name__}"
+            ) from None
+
+        except ValueError:
+
+            ACB_ACCESS_TOKEN = None
+            ACB_TOKEN_EXPIRES_AT = 0
+
+            raise RuntimeError(
+                "ACB returned invalid JSON"
+            ) from None
+
+
+# ============================================================
+# ACB AUTHORIZATION HEADERS
+# ============================================================
+
+def acb_headers(extra_headers=None):
+
+    token = get_acb_access_token()
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": "Bearer " + token
+    }
+
+    if extra_headers:
+
+        headers.update(extra_headers)
+
+    return headers
+
+
+# ============================================================
 # HOME
 # ============================================================
 
@@ -134,10 +366,61 @@ def require_api_key(func):
 def home():
 
     return jsonify({
-        "name": "Bank Dev API",
-        "version": "1.1.0",
+
+        "name": PROGRAM_NAME,
+
+        "version": PROGRAM_VERSION,
+
         "status": "online",
-        "message": "Demo API for development/testing only"
+
+        "message": "BankDev One API is running",
+
+        "services": {
+
+            "register": "/api/register",
+
+            "deposit": "/api/deposit",
+
+            "withdraw": "/api/withdraw",
+
+            "transfer": "/api/transfer",
+
+            "balance": "/api/balance",
+
+            "transactions": "/api/transactions",
+
+            "acb_token_check": "/ACB/token/check",
+
+            "health": "/health"
+
+        }
+
+    })
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.get("/health")
+def health():
+
+    return jsonify({
+
+        "status": "online",
+
+        "service": PROGRAM_NAME,
+
+        "version": PROGRAM_VERSION,
+
+        "database": "configured",
+
+        "acb_oauth_configured": bool(
+            ACB_CLIENT_ID
+            and ACB_CLIENT_SECRET
+            and ACB_TOKEN_URL
+        )
+
     })
 
 
@@ -149,36 +432,55 @@ def home():
 def register():
 
     account_number = generate_account_number()
+
     api_key = generate_api_key()
+
     created_at = now_utc()
 
     conn = get_db()
 
-    conn.execute("""
-        INSERT INTO accounts
-        (account_number, api_key, balance, created_at)
-        VALUES (?, ?, 0, ?)
-    """, (
-        account_number,
-        api_key,
-        created_at
-    ))
+    try:
 
-    conn.commit()
-    conn.close()
+        conn.execute("""
+            INSERT INTO accounts
+            (
+                account_number,
+                api_key,
+                balance,
+                created_at
+            )
+            VALUES (?, ?, 0, ?)
+        """, (
+            account_number,
+            api_key,
+            created_at
+        ))
+
+        conn.commit()
+
+    finally:
+
+        conn.close()
 
     return jsonify({
+
         "status": "success",
+
         "message": "Account created",
+
         "account_number": account_number,
+
         "api_key": api_key,
+
         "balance": 0,
+
         "created_at": created_at
+
     }), 201
 
 
 # ============================================================
-# DEPOSIT - NẠP TIỀN
+# DEPOSIT
 # ============================================================
 
 @app.post("/api/deposit")
@@ -188,19 +490,16 @@ def deposit(account):
     data = request.get_json(silent=True)
 
     if not isinstance(data, dict):
+
         return jsonify({
             "status": "error",
             "message": "JSON body is required"
         }), 400
 
-    amount = data.get("amount")
-    description = data.get(
-        "description",
-        "Nạp tiền"
-    )
-
     try:
-        amount = int(amount)
+
+        amount = int(data.get("amount"))
+
     except (TypeError, ValueError):
 
         return jsonify({
@@ -215,7 +514,12 @@ def deposit(account):
             "message": "amount must be greater than 0"
         }), 400
 
+    description = str(
+        data.get("description", "Nạp tiền")
+    )
+
     transaction_id = generate_transaction_id("TX")
+
     created_at = now_utc()
 
     conn = get_db()
@@ -242,9 +546,7 @@ def deposit(account):
                 "message": "Account not found"
             }), 404
 
-        current_balance = row["balance"]
-
-        new_balance = current_balance + amount
+        new_balance = row["balance"] + amount
 
         conn.execute(
             """
@@ -275,7 +577,7 @@ def deposit(account):
             account["account_number"],
             amount,
             new_balance,
-            str(description),
+            description,
             created_at
         ))
 
@@ -291,19 +593,28 @@ def deposit(account):
         conn.close()
 
     return jsonify({
+
         "status": "success",
+
         "transaction_id": transaction_id,
+
         "account_number": account["account_number"],
+
         "transaction_type": "DEPOSIT",
+
         "amount": amount,
+
         "balance": new_balance,
+
         "description": description,
+
         "created_at": created_at
+
     })
 
 
 # ============================================================
-# WITHDRAW - RÚT TIỀN
+# WITHDRAW
 # ============================================================
 
 @app.post("/api/withdraw")
@@ -319,15 +630,9 @@ def withdraw(account):
             "message": "JSON body is required"
         }), 400
 
-    amount = data.get("amount")
-
-    description = data.get(
-        "description",
-        "Rút tiền"
-    )
-
     try:
-        amount = int(amount)
+
+        amount = int(data.get("amount"))
 
     except (TypeError, ValueError):
 
@@ -343,7 +648,12 @@ def withdraw(account):
             "message": "amount must be greater than 0"
         }), 400
 
+    description = str(
+        data.get("description", "Rút tiền")
+    )
+
     transaction_id = generate_transaction_id("WD")
+
     created_at = now_utc()
 
     conn = get_db()
@@ -372,16 +682,20 @@ def withdraw(account):
 
         current_balance = row["balance"]
 
-        # Không cho rút vượt quá số dư
         if amount > current_balance:
 
             conn.rollback()
 
             return jsonify({
+
                 "status": "error",
+
                 "message": "Insufficient balance",
+
                 "balance": current_balance,
+
                 "requested_amount": amount
+
             }), 400
 
         new_balance = current_balance - amount
@@ -415,7 +729,7 @@ def withdraw(account):
             account["account_number"],
             amount,
             new_balance,
-            str(description),
+            description,
             created_at
         ))
 
@@ -431,19 +745,28 @@ def withdraw(account):
         conn.close()
 
     return jsonify({
+
         "status": "success",
+
         "transaction_id": transaction_id,
+
         "account_number": account["account_number"],
+
         "transaction_type": "WITHDRAW",
+
         "amount": amount,
+
         "balance": new_balance,
+
         "description": description,
+
         "created_at": created_at
+
     })
 
 
 # ============================================================
-# TRANSFER - CHUYỂN TIỀN
+# TRANSFER - INTERNAL BANKDEV TRANSFER
 # ============================================================
 
 @app.post("/api/transfer")
@@ -460,12 +783,6 @@ def transfer(account):
         }), 400
 
     to_account = data.get("to_account")
-    amount = data.get("amount")
-
-    description = data.get(
-        "description",
-        "Chuyển tiền"
-    )
 
     if not to_account:
 
@@ -478,7 +795,7 @@ def transfer(account):
 
     try:
 
-        amount = int(amount)
+        amount = int(data.get("amount"))
 
     except (TypeError, ValueError):
 
@@ -496,7 +813,6 @@ def transfer(account):
 
     from_account = account["account_number"]
 
-    # Không cho chuyển cho chính mình
     if from_account == to_account:
 
         return jsonify({
@@ -504,19 +820,19 @@ def transfer(account):
             "message": "Cannot transfer to the same account"
         }), 400
 
+    description = str(
+        data.get("description", "Chuyển tiền")
+    )
+
     transaction_id = generate_transaction_id("TR")
+
     created_at = now_utc()
 
     conn = get_db()
 
     try:
 
-        # Khóa transaction SQLite
         conn.execute("BEGIN IMMEDIATE")
-
-        # ----------------------------------------------------
-        # Tìm tài khoản nhận
-        # ----------------------------------------------------
 
         receiver = conn.execute(
             """
@@ -536,10 +852,6 @@ def transfer(account):
                 "message": "Receiver account not found",
                 "to_account": to_account
             }), 404
-
-        # ----------------------------------------------------
-        # Lấy số dư người gửi
-        # ----------------------------------------------------
 
         sender = conn.execute(
             """
@@ -561,35 +873,27 @@ def transfer(account):
 
         sender_balance = sender["balance"]
 
-        # ----------------------------------------------------
-        # Kiểm tra số dư
-        # ----------------------------------------------------
-
         if amount > sender_balance:
 
             conn.rollback()
 
             return jsonify({
-                "status": "error",
-                "message": "Insufficient balance",
-                "balance": sender_balance,
-                "requested_amount": amount
-            }), 400
 
-        # ----------------------------------------------------
-        # Tính số dư mới
-        # ----------------------------------------------------
+                "status": "error",
+
+                "message": "Insufficient balance",
+
+                "balance": sender_balance,
+
+                "requested_amount": amount
+
+            }), 400
 
         sender_new_balance = sender_balance - amount
 
-        receiver_new_balance = (
-            receiver["balance"] + amount
-        )
+        receiver_new_balance = receiver["balance"] + amount
 
-        # ----------------------------------------------------
-        # Trừ tiền người gửi
-        # ----------------------------------------------------
-
+        # Update sender
         conn.execute(
             """
             UPDATE accounts
@@ -602,10 +906,7 @@ def transfer(account):
             )
         )
 
-        # ----------------------------------------------------
-        # Cộng tiền người nhận
-        # ----------------------------------------------------
-
+        # Update receiver
         conn.execute(
             """
             UPDATE accounts
@@ -618,14 +919,7 @@ def transfer(account):
             )
         )
 
-        # ----------------------------------------------------
-        # Lịch sử người gửi
-        # ----------------------------------------------------
-
-        sender_description = (
-            f"{description} - Đến {to_account}"
-        )
-
+        # Sender transaction
         conn.execute("""
             INSERT INTO transactions
             (
@@ -643,17 +937,12 @@ def transfer(account):
             from_account,
             amount,
             sender_new_balance,
-            sender_description,
+            f"{description} - Đến {to_account}",
             created_at
         ))
 
-        # ----------------------------------------------------
-        # Lịch sử người nhận
-        # ----------------------------------------------------
-
-        receiver_description = (
-            f"{description} - Từ {from_account}"
-        )
+        # Receiver transaction
+        receiver_transaction_id = generate_transaction_id("TR")
 
         conn.execute("""
             INSERT INTO transactions
@@ -668,11 +957,11 @@ def transfer(account):
             )
             VALUES (?, ?, 'TRANSFER_IN', ?, ?, ?, ?)
         """, (
-            transaction_id,
+            receiver_transaction_id,
             to_account,
             amount,
             receiver_new_balance,
-            receiver_description,
+            f"{description} - Từ {from_account}",
             created_at
         ))
 
@@ -688,21 +977,32 @@ def transfer(account):
         conn.close()
 
     return jsonify({
+
         "status": "success",
+
         "transaction_id": transaction_id,
+
         "transaction_type": "TRANSFER",
+
         "from_account": from_account,
+
         "to_account": to_account,
+
         "amount": amount,
+
         "sender_balance": sender_new_balance,
+
         "receiver_balance": receiver_new_balance,
+
         "description": description,
+
         "created_at": created_at
+
     })
 
 
 # ============================================================
-# BALANCE - SỐ DƯ
+# BALANCE
 # ============================================================
 
 @app.get("/api/balance")
@@ -711,16 +1011,20 @@ def balance(account):
 
     conn = get_db()
 
-    row = conn.execute(
-        """
-        SELECT balance
-        FROM accounts
-        WHERE account_number = ?
-        """,
-        (account["account_number"],)
-    ).fetchone()
+    try:
 
-    conn.close()
+        row = conn.execute(
+            """
+            SELECT balance
+            FROM accounts
+            WHERE account_number = ?
+            """,
+            (account["account_number"],)
+        ).fetchone()
+
+    finally:
+
+        conn.close()
 
     if row is None:
 
@@ -730,14 +1034,18 @@ def balance(account):
         }), 404
 
     return jsonify({
+
         "status": "success",
+
         "account_number": account["account_number"],
+
         "balance": row["balance"]
+
     })
 
 
 # ============================================================
-# TRANSACTIONS - LỊCH SỬ GIAO DỊCH
+# TRANSACTIONS
 # ============================================================
 
 @app.get("/api/transactions")
@@ -746,56 +1054,164 @@ def transactions(account):
 
     conn = get_db()
 
-    rows = conn.execute("""
-        SELECT
-            transaction_id,
-            transaction_type,
-            amount,
-            balance_after,
-            description,
-            created_at
-        FROM transactions
-        WHERE account_number = ?
-        ORDER BY id DESC
-    """, (
-        account["account_number"],
-    )).fetchall()
+    try:
 
-    conn.close()
+        rows = conn.execute("""
+            SELECT
+                transaction_id,
+                transaction_type,
+                amount,
+                balance_after,
+                description,
+                created_at
+            FROM transactions
+            WHERE account_number = ?
+            ORDER BY id DESC
+        """, (
+            account["account_number"],
+        )).fetchall()
+
+    finally:
+
+        conn.close()
 
     return jsonify({
+
         "status": "success",
+
         "account_number": account["account_number"],
+
         "transactions": [
             dict(row)
             for row in rows
         ]
+
     })
 
 
 # ============================================================
-# 404
+# ACB TOKEN CHECK
+# ============================================================
+
+@app.get("/ACB/token/check")
+@require_api_key
+def acb_token_check(account):
+
+    try:
+
+        token = get_acb_access_token()
+
+        return jsonify({
+
+            "status": "success",
+
+            "message": "ACB access token obtained successfully",
+
+            "token_obtained": bool(token),
+
+            "account_number": account["account_number"],
+
+            "token_type": "Bearer",
+
+            "expires_in_seconds": max(
+                0,
+                int(
+                    ACB_TOKEN_EXPIRES_AT - time.monotonic()
+                )
+            )
+
+        }), 200
+
+    except Exception as error:
+
+        return jsonify({
+
+            "status": "error",
+
+            "message": "Unable to obtain ACB access token",
+
+            "detail": str(error)
+
+        }), 502
+
+
+# ============================================================
+# ACB TOKEN FORCE REFRESH
+# ============================================================
+
+@app.post("/ACB/token/refresh")
+@require_api_key
+def acb_token_refresh(account):
+
+    try:
+
+        token = get_acb_access_token(
+            force_refresh=True
+        )
+
+        return jsonify({
+
+            "status": "success",
+
+            "message": "ACB token refreshed successfully",
+
+            "token_obtained": bool(token),
+
+            "account_number": account["account_number"],
+
+            "token_type": "Bearer",
+
+            "expires_in_seconds": max(
+                0,
+                int(
+                    ACB_TOKEN_EXPIRES_AT - time.monotonic()
+                )
+            )
+
+        }), 200
+
+    except Exception as error:
+
+        return jsonify({
+
+            "status": "error",
+
+            "message": "Unable to refresh ACB token",
+
+            "detail": str(error)
+
+        }), 502
+
+
+# ============================================================
+# 404 ERROR
 # ============================================================
 
 @app.errorhandler(404)
 def not_found(error):
 
     return jsonify({
+
         "status": "error",
+
         "message": "Endpoint not found"
+
     }), 404
 
 
 # ============================================================
-# 405
+# 405 ERROR
 # ============================================================
 
 @app.errorhandler(405)
 def method_not_allowed(error):
 
     return jsonify({
+
         "status": "error",
+
         "message": "HTTP method not allowed"
+
     }), 405
 
 
@@ -813,11 +1229,11 @@ init_db()
 if __name__ == "__main__":
 
     app.run(
+
         host="0.0.0.0",
+
         port=int(
-            os.environ.get(
-                "PORT",
-                8080
-            )
+            os.environ.get("PORT", 8080)
         )
+
     )
