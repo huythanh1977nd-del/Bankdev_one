@@ -1243,12 +1243,12 @@ def acb_payment_order(account):
             }), 502
 
         # 5. Gắn authorization đúng vị trí
-request_parameters["authorizations"] = [
-    {
-        "authorizationString": authorization_string,
-        "authorizationId": authorization_id
-    }
-]
+        request_parameters["authorizations"] = [
+          {
+            "authorizationString": authorization_string,
+            "authorizationId": authorization_id
+          }
+        ]
 
         # 6. Tạo header gửi đến ACB
         headers = {
@@ -1279,17 +1279,17 @@ request_parameters["authorizations"] = [
             }
 
        # 9. Trả kết quả ACB về BDO 4
-return jsonify({
-    "status": (
+       return jsonify({
+        "status": (
         "success"
         if 200 <= response.status_code < 300
         else "error"
-    ),
-    "message": "ACB Payment Order response",
-    "bankdev_account": account["account_number"],
-    "acb_http_status": response.status_code,
-    "acb_response": acb_result
-}), response.status_code
+      ),
+      "message": "ACB Payment Order response",
+      "bankdev_account": account["account_number"],
+      "acb_http_status": response.status_code,
+      "acb_response": acb_result
+      }), response.status_code
 
     except requests.Timeout:
         return jsonify({
