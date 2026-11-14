@@ -1151,6 +1151,7 @@ def acb_token_refresh(account):
         }), 502
 
 
+
 # ============================================================
 # ACB PAYMENT ORDER - BANKDEV ONE
 # ============================================================
@@ -1244,10 +1245,10 @@ def acb_payment_order(account):
 
         # 5. Gắn authorization đúng vị trí
         request_parameters["authorizations"] = [
-          {
-            "authorizationString": authorization_string,
-            "authorizationId": authorization_id
-          }
+            {
+                "authorizationString": authorization_string,
+                "authorizationId": authorization_id
+            }
         ]
 
         # 6. Tạo header gửi đến ACB
@@ -1278,18 +1279,18 @@ def acb_payment_order(account):
                 "raw_response": response.text
             }
 
-       # 9. Trả kết quả ACB về BDO 4
-       return jsonify({
-        "status": (
-        "success"
-        if 200 <= response.status_code < 300
-        else "error"
-      ),
-      "message": "ACB Payment Order response",
-      "bankdev_account": account["account_number"],
-      "acb_http_status": response.status_code,
-      "acb_response": acb_result
-      }), response.status_code
+        # 9. Trả kết quả ACB về BDO 4
+        return jsonify({
+            "status": (
+                "success"
+                if 200 <= response.status_code < 300
+                else "error"
+            ),
+            "message": "ACB Payment Order response",
+            "bankdev_account": account["account_number"],
+            "acb_http_status": response.status_code,
+            "acb_response": acb_result
+        }), response.status_code
 
     except requests.Timeout:
         return jsonify({
@@ -1321,7 +1322,6 @@ def acb_payment_order(account):
 
 @app.errorhandler(404)
 def not_found(error):
-
     return jsonify({
         "status": "error",
         "message": "Endpoint not found"
@@ -1334,43 +1334,11 @@ def not_found(error):
 
 @app.errorhandler(405)
 def method_not_allowed(error):
-
     return jsonify({
         "status": "error",
         "message": "HTTP method not allowed"
     }), 405
 
-
-# ============================================================
-# 404 ERROR
-# ============================================================
-
-@app.errorhandler(404)
-def not_found(error):
-
-    return jsonify({
-
-        "status": "error",
-
-        "message": "Endpoint not found"
-
-    }), 404
-
-
-# ============================================================
-# 405 ERROR
-# ============================================================
-
-@app.errorhandler(405)
-def method_not_allowed(error):
-
-    return jsonify({
-
-        "status": "error",
-
-        "message": "HTTP method not allowed"
-
-    }), 405
 
 
 # ============================================================
