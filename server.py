@@ -1257,6 +1257,7 @@ def acb_payment_order(account):
             "Content-Type": "application/json",
             "Accept": "application/json",
             "X-Client-ID": client_id,
+            "X-Request-ID": acb_request_id,
             "X-Service": "Payment Order",
             "X-Provider-ID": provider_id,
             "X-Channel": channel
