@@ -2,6 +2,7 @@ import os
 import time
 import secrets
 import sqlite3
+import uuid
 import threading
 import requests
 
