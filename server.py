@@ -1318,6 +1318,309 @@ def acb_payment_order(account):
 
 
 # ============================================================
+# ACB ONE CONNECT - CREDIT
+# BANKDEV ONE BDO 4
+# ============================================================
+
+@app.post("/ACB/credit")
+@require_api_key
+def bankdev_acb_credit(account):
+
+    try:
+
+        # ----------------------------------------------------
+        # 1. READ REQUEST BODY
+        # ----------------------------------------------------
+
+        payload = request.get_json(silent=True)
+
+        if payload is None:
+            payload = {}
+
+        if not isinstance(payload, dict):
+            return jsonify({
+                "status": "error",
+                "message": "Request body must be a JSON object"
+            }), 400
+
+        # ----------------------------------------------------
+        # 2. VALIDATE TRANSACTION AMOUNT
+        # ----------------------------------------------------
+
+        amount = payload.get("transactionAmount", 100000)
+
+        if isinstance(amount, bool) or not isinstance(amount, int):
+            return jsonify({
+                "status": "error",
+                "message": "transactionAmount must be an integer"
+            }), 400
+
+        if amount <= 0 or amount > 500000000:
+            return jsonify({
+                "status": "error",
+                "message": "Invalid transactionAmount"
+            }), 400
+
+        # ----------------------------------------------------
+        # 3. VALIDATE DESCRIPTION
+        # ----------------------------------------------------
+
+        description = payload.get(
+            "description",
+            "NAP TIEN KIEM THU BANKDEV ONE"
+        )
+
+        if not isinstance(description, str):
+            return jsonify({
+                "status": "error",
+                "message": "description must be a string"
+            }), 400
+
+        description = description.strip()
+
+        if not description or len(description) > 255:
+            return jsonify({
+                "status": "error",
+                "message": "description must contain 1-255 characters"
+            }), 400
+
+        # ----------------------------------------------------
+        # 4. NUMBER OF TRANSACTIONS
+        # ----------------------------------------------------
+
+        number_of_transaction = payload.get(
+            "numberOfTransaction", 1
+        )
+
+        if (
+            isinstance(number_of_transaction, bool)
+            or not isinstance(number_of_transaction, int)
+            or not 1 <= number_of_transaction <= 10
+        ):
+            return jsonify({
+                "status": "error",
+                "message": "numberOfTransaction must be between 1 and 10"
+            }), 400
+
+        # ----------------------------------------------------
+        # 5. READ RENDER ENVIRONMENT VARIABLES
+        # ----------------------------------------------------
+
+        credit_url = os.environ.get(
+            "ACB_CREDIT_URL",
+            "https://sandbox.acb.com.vn/acb/open/payment/payment-execution/v1/credit"
+        ).strip()
+
+        client_id = os.environ.get(
+            "ACB_HEADER_CLIENT_ID", ""
+        ).strip()
+
+        provider_id = os.environ.get(
+            "ACB_PROVIDER_ID", "ACBS"
+        ).strip()
+
+        channel = os.environ.get(
+            "ACB_CHANNEL", "SOBA"
+        ).strip()
+
+        required = {
+            "ACB_HEADER_CLIENT_ID": client_id,
+            "ACB_PROVIDER_ID": provider_id,
+            "ACB_CHANNEL": channel
+        }
+
+        missing = [
+            key for key, value in required.items()
+            if not value
+        ]
+
+        if missing:
+            return jsonify({
+                "status": "error",
+                "message": "Missing ACB configuration",
+                "missing_variables": missing
+            }), 500
+
+        # ----------------------------------------------------
+        # 6. GET ACB OAUTH ACCESS TOKEN
+        # ----------------------------------------------------
+
+        token = get_acb_access_token()
+
+        if not token:
+            return jsonify({
+                "status": "error",
+                "message": "Unable to obtain ACB access token"
+            }), 502
+
+        # ----------------------------------------------------
+        # 7. GENERATE REQUEST ID AND REQUEST TRACE
+        # ----------------------------------------------------
+
+        request_id = str(uuid.uuid4())
+
+        request_trace = str(uuid.uuid4())
+
+        request_datetime = (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+
+        # ----------------------------------------------------
+        # 8. ACB REQUEST HEADERS
+        # ----------------------------------------------------
+
+        headers = {
+            "Authorization": "Bearer " + token,
+            "X-Client-ID": client_id,
+            "X-Provider-ID": provider_id,
+            "X-Request-ID": request_id,
+            "X-Channel": channel,
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
+
+        # ----------------------------------------------------
+        # 9. ACB REQUEST BODY
+        # ----------------------------------------------------
+
+        acb_payload = {
+            "requestTrace": request_trace,
+            "requestDateTime": request_datetime,
+            "requestParameters": {
+                "transactionAmount": amount,
+                "description": description,
+                "numberOfTransaction": number_of_transaction
+            }
+        }
+
+        # ----------------------------------------------------
+        # 10. LOG TRANSACTION
+        # ----------------------------------------------------
+
+        print("\n======================================")
+        print("BANKDEV ONE -> ACB ONE CONNECT")
+        print("======================================")
+
+        print("Environment:", "SANDBOX")
+        print("Account:", account["account_number"])
+        print("Amount:", f"{amount:,} VND")
+        print("Request ID:", request_id)
+        print("Request Trace:", request_trace)
+        print("Request Date:", request_datetime)
+
+        print("ACB CREDIT REQUEST:")
+        print(json.dumps(
+            acb_payload,
+            ensure_ascii=False,
+            indent=4
+        ))
+
+        # ----------------------------------------------------
+        # 11. SEND REQUEST TO ACB
+        # ----------------------------------------------------
+
+        response = requests.post(
+            credit_url,
+            headers=headers,
+            json=acb_payload,
+            timeout=30
+        )
+
+        # ----------------------------------------------------
+        # 12. READ ACB RESPONSE
+        # ----------------------------------------------------
+
+        try:
+            acb_result = response.json()
+
+        except ValueError:
+            acb_result = {
+                "raw_response": response.text
+            }
+
+        response_status = (
+            acb_result.get("responseStatus", {})
+            if isinstance(acb_result, dict)
+            else {}
+        )
+
+        response_code = response_status.get(
+            "responseCode", ""
+        )
+
+        response_message = response_status.get(
+            "responseMessage", ""
+        )
+
+        # ----------------------------------------------------
+        # 13. CHECK BUSINESS RESULT
+        # ----------------------------------------------------
+
+        success = (
+            response.status_code == 200
+            and response_code == "00000000"
+        )
+
+        print("\nACB HTTP STATUS:", response.status_code)
+
+        print("ACB RESPONSE CODE:", response_code)
+
+        print("ACB RESPONSE MESSAGE:", response_message)
+
+        print("ACB RESPONSE:")
+        print(json.dumps(
+            acb_result,
+            ensure_ascii=False,
+            indent=4
+        ))
+
+        # ----------------------------------------------------
+        # 14. RETURN RESULT TO BANKDEV ONE
+        # ----------------------------------------------------
+
+        return jsonify({
+            "status": "success" if success else "failed",
+            "message": response_message,
+            "bankdev_account": account["account_number"],
+            "transaction_amount": amount,
+            "currency": "VND",
+            "request_id": request_id,
+            "request_trace": request_trace,
+            "acb_http_status": response.status_code,
+            "acb_response_code": response_code,
+            "acb_response": acb_result
+        }), 200 if success else 502
+
+    except requests.Timeout:
+
+        return jsonify({
+            "status": "unknown",
+            "message": (
+                "ACB request timeout. "
+                "Check transaction status before retrying."
+            )
+        }), 504
+
+    except requests.RequestException as error:
+
+        return jsonify({
+            "status": "error",
+            "message": "Unable to connect to ACB",
+            "detail": str(error)
+        }), 502
+
+    except Exception as error:
+
+        return jsonify({
+            "status": "error",
+            "message": "BankDev One ACB Credit error",
+            "detail": str(error)
+        }), 500
+
+
+# ============================================================
 # 404 ERROR
 # ============================================================
 
