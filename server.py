@@ -1153,17 +1153,21 @@ def acb_token_refresh(account):
 
 
 
+
 # ============================================================
 # ACB PAYMENT ORDER - BANKDEV ONE
+# FIX: acb_request_id NOT DEFINED
 # ============================================================
 
 @app.post("/ACB/payment-order")
 @require_api_key
 def acb_payment_order(account):
 
+    acb_request_id = None
+
     try:
 
-        # 1. Lấy dữ liệu giao dịch từ BDO 4
+        # 1. Nhận dữ liệu giao dịch
         payload = request.get_json(silent=True)
 
         if not isinstance(payload, dict):
@@ -1172,13 +1176,28 @@ def acb_payment_order(account):
                 "message": "Request body must be valid JSON"
             }), 400
 
-        # 2. Kiểm tra cấu trúc dữ liệu
-        request_parameters = payload.get("requestParameters")
+        # 2. Lấy Request ID từ yêu cầu ban đầu
+        # Nếu chưa có thì tạo UUID mới
+        acb_request_id = str(
+            payload.get("requestTrace") or uuid.uuid4()
+        ).strip()
+
+        if not acb_request_id:
+            acb_request_id = str(uuid.uuid4())
+
+        # Dùng thống nhất Request ID
+        payload["requestTrace"] = acb_request_id
+
+        # 3. Kiểm tra cấu trúc dữ liệu
+        request_parameters = payload.get(
+            "requestParameters"
+        )
 
         if not isinstance(request_parameters, dict):
             return jsonify({
                 "status": "error",
-                "message": "Missing requestParameters"
+                "message": "Missing requestParameters",
+                "request_id": acb_request_id
             }), 400
 
         data = request_parameters.get("data")
@@ -1186,10 +1205,11 @@ def acb_payment_order(account):
         if not isinstance(data, dict):
             return jsonify({
                 "status": "error",
-                "message": "Missing requestParameters.data"
+                "message": "Missing requestParameters.data",
+                "request_id": acb_request_id
             }), 400
 
-        # 3. Đọc cấu hình ACB từ Render Environment
+        # 4. Đọc cấu hình ACB từ Render
         payment_url = os.environ.get(
             "ACB_PAYMENT_URL", ""
         ).strip()
@@ -1232,19 +1252,21 @@ def acb_payment_order(account):
             return jsonify({
                 "status": "error",
                 "message": "Missing ACB configuration",
-                "missing_variables": missing
+                "missing_variables": missing,
+                "request_id": acb_request_id
             }), 500
 
-        # 4. Lấy OAuth access token
+        # 5. Lấy ACB Access Token
         token = get_acb_access_token()
 
         if not token:
             return jsonify({
                 "status": "error",
-                "message": "Unable to obtain ACB access token"
+                "message": "Unable to obtain ACB access token",
+                "request_id": acb_request_id
             }), 502
 
-        # 5. Gắn authorization đúng vị trí
+        # 6. Gắn thông tin Authorization
         request_parameters["authorizations"] = [
             {
                 "authorizationString": authorization_string,
@@ -1252,7 +1274,7 @@ def acb_payment_order(account):
             }
         ]
 
-        # 6. Tạo header gửi đến ACB
+        # 7. Tạo Header
         headers = {
             "Authorization": "Bearer " + token,
             "Content-Type": "application/json",
@@ -1264,8 +1286,15 @@ def acb_payment_order(account):
             "X-Channel": channel
         }
 
-        # 7. Gửi lệnh đến ACB Sandbox
-        # Không tự động gửi lại nếu bị timeout.
+        print("\n================================")
+        print("BANKDEV ONE -> ACB ONEBIZ")
+        print("PAYMENT ORDER")
+        print("================================")
+        print("Request ID:", acb_request_id)
+        print("Source:", data.get("sourceAccountNumber"))
+
+        # 8. Gửi yêu cầu đến ACB
+        # Không tự động retry khi timeout
         response = requests.post(
             payment_url,
             headers=headers,
@@ -1273,7 +1302,7 @@ def acb_payment_order(account):
             timeout=30
         )
 
-        # 8. Đọc kết quả trả về
+        # 9. Đọc phản hồi ACB
         try:
             acb_result = response.json()
         except ValueError:
@@ -1281,40 +1310,51 @@ def acb_payment_order(account):
                 "raw_response": response.text
             }
 
-        # 9. Trả kết quả ACB về BDO 4
+        print("ACB HTTP:", response.status_code)
+        print("ACB RESPONSE:", acb_result)
+
+        # 10. Trả kết quả về BankDev
         return jsonify({
             "status": (
-                "success"
+                "response_received"
                 if 200 <= response.status_code < 300
                 else "error"
             ),
             "message": "ACB Payment Order response",
+            "request_id": acb_request_id,
             "bankdev_account": account["account_number"],
             "acb_http_status": response.status_code,
-            "acb_response": acb_result
+            "acb_response": acb_result,
+            "requires_result_validation": True
         }), response.status_code
 
     except requests.Timeout:
+
         return jsonify({
             "status": "unknown",
             "message": (
                 "ACB request timed out. "
                 "Check transaction status before retrying."
-            )
+            ),
+            "request_id": acb_request_id
         }), 504
 
     except requests.RequestException as error:
+
         return jsonify({
             "status": "error",
             "message": "Unable to connect to ACB",
-            "detail": str(error)
+            "detail": str(error),
+            "request_id": acb_request_id
         }), 502
 
     except Exception as error:
+
         return jsonify({
             "status": "error",
             "message": "BankDev One ACB Payment Order error",
-            "detail": str(error)
+            "detail": str(error),
+            "request_id": acb_request_id
         }), 500
 
 
