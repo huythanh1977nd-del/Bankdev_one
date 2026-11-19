@@ -1159,14 +1159,17 @@ def acb_token_refresh(account):
 # FIX: acb_request_id NOT DEFINED
 # ============================================================
 
+
 @app.post("/ACB/payment-order")
 @require_api_key
 def acb_payment_order(account):
 
+    global ACB_ACCESS_TOKEN
+    global ACB_TOKEN_EXPIRES_AT
+
     acb_request_id = None
 
     try:
-
         # 1. Nhận dữ liệu giao dịch
         payload = request.get_json(silent=True)
 
@@ -1176,8 +1179,7 @@ def acb_payment_order(account):
                 "message": "Request body must be valid JSON"
             }), 400
 
-        # 2. Lấy Request ID từ yêu cầu ban đầu
-        # Nếu chưa có thì tạo UUID mới
+        # 2. Giữ nguyên requestTrace của giao dịch
         acb_request_id = str(
             payload.get("requestTrace") or uuid.uuid4()
         ).strip()
@@ -1185,7 +1187,6 @@ def acb_payment_order(account):
         if not acb_request_id:
             acb_request_id = str(uuid.uuid4())
 
-        # Dùng thống nhất Request ID
         payload["requestTrace"] = acb_request_id
 
         # 3. Kiểm tra cấu trúc dữ liệu
@@ -1209,7 +1210,7 @@ def acb_payment_order(account):
                 "request_id": acb_request_id
             }), 400
 
-        # 4. Đọc cấu hình ACB từ Render
+        # 4. Đọc cấu hình ACB
         payment_url = os.environ.get(
             "ACB_PAYMENT_URL", ""
         ).strip()
@@ -1256,7 +1257,7 @@ def acb_payment_order(account):
                 "request_id": acb_request_id
             }), 500
 
-        # 5. Lấy ACB Access Token
+        # 5. Lấy Access Token hiện tại
         token = get_acb_access_token()
 
         if not token:
@@ -1266,7 +1267,7 @@ def acb_payment_order(account):
                 "request_id": acb_request_id
             }), 502
 
-        # 6. Gắn thông tin Authorization
+        # 6. Giữ nguyên thông tin Authorization trong payload
         request_parameters["authorizations"] = [
             {
                 "authorizationString": authorization_string,
@@ -1293,8 +1294,7 @@ def acb_payment_order(account):
         print("Request ID:", acb_request_id)
         print("Source:", data.get("sourceAccountNumber"))
 
-        # 8. Gửi yêu cầu đến ACB
-        # Không tự động retry khi timeout
+        # 8. Gửi giao dịch lần thứ nhất
         response = requests.post(
             payment_url,
             headers=headers,
@@ -1302,9 +1302,52 @@ def acb_payment_order(account):
             timeout=30
         )
 
-        # 9. Đọc phản hồi ACB
+        # 9. Nếu ACB trả HTTP 401 thì làm mới token
+        if response.status_code == 401:
+
+            print("ACB HTTP 401: Access Token expired or invalid")
+            print("Clearing old Access Token...")
+
+            # Xóa Access Token cũ
+            with ACB_TOKEN_LOCK:
+                ACB_ACCESS_TOKEN = None
+                ACB_TOKEN_EXPIRES_AT = 0
+
+            # Gọi OAuth lấy Access Token mới
+            print("Requesting new ACB Access Token...")
+
+            new_token = get_acb_access_token(
+                force_refresh=True
+            )
+
+            if not new_token:
+                return jsonify({
+                    "status": "error",
+                    "message": "Unable to refresh ACB Access Token",
+                    "request_id": acb_request_id
+                }), 502
+
+            # Chỉ cập nhật Authorization
+            # Giữ nguyên Request ID và payload giao dịch
+            headers["Authorization"] = (
+                "Bearer " + new_token
+            )
+
+            print("New Access Token obtained successfully")
+            print("Retrying original transaction once...")
+
+            # Gửi lại đúng giao dịch ban đầu
+            response = requests.post(
+                payment_url,
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+
+        # 10. Đọc phản hồi ACB
         try:
             acb_result = response.json()
+
         except ValueError:
             acb_result = {
                 "raw_response": response.text
@@ -1313,7 +1356,7 @@ def acb_payment_order(account):
         print("ACB HTTP:", response.status_code)
         print("ACB RESPONSE:", acb_result)
 
-        # 10. Trả kết quả về BankDev
+        # 11. Trả kết quả về BankDev One
         return jsonify({
             "status": (
                 "response_received"
@@ -1325,11 +1368,15 @@ def acb_payment_order(account):
             "bankdev_account": account["account_number"],
             "acb_http_status": response.status_code,
             "acb_response": acb_result,
+            "retry_performed": (
+                response.status_code == 401
+            ),
             "requires_result_validation": True
         }), response.status_code
 
     except requests.Timeout:
 
+        # Tuyệt đối không tự động gửi lại khi timeout
         return jsonify({
             "status": "unknown",
             "message": (
