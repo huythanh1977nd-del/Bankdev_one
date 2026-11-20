@@ -123,29 +123,33 @@ def generate_transaction_id(prefix="TX"):
     )
 
 
-def generate_account_number():
+def generate_account_number(conn):
+    """
+    Cấp số tài khoản 8 chữ số:
+    Bắt đầu từ 51113526, sau đó tăng tuần tự.
+    Phải gọi bên trong giao dịch BEGIN IMMEDIATE.
+    """
 
-    while True:
+    row = conn.execute("""
+        SELECT MAX(CAST(account_number AS INTEGER))
+        FROM accounts
+        WHERE account_number GLOB '5111[0-9][0-9][0-9][0-9]'
+    """).fetchone()
 
-        number = str(
-            secrets.randbelow(900000000000) + 100000000000
+    last_number = row[0]
+
+    if last_number is None:
+        next_number = 51113526
+    else:
+        next_number = int(last_number) + 1
+
+    if next_number > 51119999:
+        raise RuntimeError(
+            "Da het dai so tai khoan 8 chu so"
         )
 
-        conn = get_db()
+    return str(next_number)
 
-        exists = conn.execute(
-            """
-            SELECT 1
-            FROM accounts
-            WHERE account_number = ?
-            """,
-            (number,)
-        ).fetchone()
-
-        conn.close()
-
-        if not exists:
-            return number
 
 
 def generate_api_key():
