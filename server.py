@@ -126,13 +126,14 @@ def generate_transaction_id(prefix="TX"):
 def generate_account_number(conn):
     """
     Cấp số tài khoản 8 chữ số.
-    Bắt đầu từ 51113526 và tăng tuần tự.
+    Bắt đầu từ 51113526.
     """
 
     row = conn.execute("""
         SELECT MAX(CAST(account_number AS INTEGER))
         FROM accounts
-        WHERE account_number GLOB '5111[0-9][0-9][0-9][0-9]'
+        WHERE CAST(account_number AS TEXT)
+        GLOB '5111[0-9][0-9][0-9][0-9]'
     """).fetchone()
 
     last_number = row[0]
@@ -147,53 +148,66 @@ def generate_account_number(conn):
 
     return str(next_number)
 
-@app.post("/api/register")
+
+@app.route("/api/register", methods=["POST"])
 def register():
 
     conn = get_db()
 
     try:
-        # Khóa giao dịch để tránh cấp trùng số tài khoản
+        # Bắt đầu giao dịch an toàn
         conn.execute("BEGIN IMMEDIATE")
 
+        # Tạo số tài khoản
         account_number = generate_account_number(conn)
 
+        # Tạo API Key
         api_key = generate_api_key()
 
+        # Thời gian tạo
         created_at = now_utc()
 
+        # Lưu tài khoản
         conn.execute("""
-            INSERT INTO accounts
-            (
+            INSERT INTO accounts (
                 account_number,
                 api_key,
                 balance,
                 created_at
             )
-            VALUES (?, ?, 0, ?)
+            VALUES (?, ?, ?, ?)
         """, (
             account_number,
             api_key,
+            0,
             created_at
         ))
 
         conn.commit()
 
-    except Exception:
+        return jsonify({
+            "status": "success",
+            "message": "Account created successfully",
+            "account_number": account_number,
+            "api_key": api_key,
+            "balance": 0,
+            "created_at": created_at
+        }), 201
+
+    except Exception as e:
+
         conn.rollback()
-        raise
+
+        app.logger.exception("REGISTER ERROR")
+
+        return jsonify({
+            "status": "error",
+            "message": "Account registration failed",
+            "error": str(e)
+        }), 500
 
     finally:
         conn.close()
-
-    return jsonify({
-        "status": "success",
-        "message": "Account created",
-        "account_number": account_number,
-        "api_key": api_key,
-        "balance": 0,
-        "created_at": created_at
-    }), 201
 
 
 # ============================================================
