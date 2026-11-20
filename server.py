@@ -2,7 +2,6 @@ import os
 import time
 import secrets
 import sqlite3
-import uuid
 import threading
 import requests
 
@@ -123,91 +122,34 @@ def generate_transaction_id(prefix="TX"):
     )
 
 
-def generate_account_number(conn):
-    """
-    Cấp số tài khoản 8 chữ số.
-    Bắt đầu từ 51113526.
-    """
+def generate_account_number():
 
-    row = conn.execute("""
-        SELECT MAX(CAST(account_number AS INTEGER))
-        FROM accounts
-        WHERE CAST(account_number AS TEXT)
-        GLOB '5111[0-9][0-9][0-9][0-9]'
-    """).fetchone()
+    while True:
 
-    last_number = row[0]
+        number = str(
+            secrets.randbelow(900000000000) + 100000000000
+        )
 
-    if last_number is None:
-        next_number = 51113526
-    else:
-        next_number = int(last_number) + 1
+        conn = get_db()
 
-    if next_number > 51119999:
-        raise RuntimeError("Da het dai so tai khoan")
+        exists = conn.execute(
+            """
+            SELECT 1
+            FROM accounts
+            WHERE account_number = ?
+            """,
+            (number,)
+        ).fetchone()
 
-    return str(next_number)
-
-
-@app.route("/api/register", methods=["POST"])
-def register():
-
-    conn = get_db()
-
-    try:
-        # Bắt đầu giao dịch an toàn
-        conn.execute("BEGIN IMMEDIATE")
-
-        # Tạo số tài khoản
-        account_number = generate_account_number(conn)
-
-        # Tạo API Key
-        api_key = generate_api_key()
-
-        # Thời gian tạo
-        created_at = now_utc()
-
-        # Lưu tài khoản
-        conn.execute("""
-            INSERT INTO accounts (
-                account_number,
-                api_key,
-                balance,
-                created_at
-            )
-            VALUES (?, ?, ?, ?)
-        """, (
-            account_number,
-            api_key,
-            0,
-            created_at
-        ))
-
-        conn.commit()
-
-        return jsonify({
-            "status": "success",
-            "message": "Account created successfully",
-            "account_number": account_number,
-            "api_key": api_key,
-            "balance": 0,
-            "created_at": created_at
-        }), 201
-
-    except Exception as e:
-
-        conn.rollback()
-
-        app.logger.exception("REGISTER ERROR")
-
-        return jsonify({
-            "status": "error",
-            "message": "Account registration failed",
-            "error": str(e)
-        }), 500
-
-    finally:
         conn.close()
+
+        if not exists:
+            return number
+
+
+def generate_api_key():
+
+    return "sk_live_" + secrets.token_urlsafe(32)
 
 
 # ============================================================
@@ -1156,25 +1098,40 @@ def transactions(account):
 def acb_token_check(account):
 
     try:
+
         token = get_acb_access_token()
 
         return jsonify({
+
             "status": "success",
+
             "message": "ACB access token obtained successfully",
+
             "token_obtained": bool(token),
+
             "account_number": account["account_number"],
+
             "token_type": "Bearer",
+
             "expires_in_seconds": max(
                 0,
-                int(ACB_TOKEN_EXPIRES_AT - time.monotonic())
+                int(
+                    ACB_TOKEN_EXPIRES_AT - time.monotonic()
+                )
             )
+
         }), 200
 
     except Exception as error:
+
         return jsonify({
+
             "status": "error",
+
             "message": "Unable to obtain ACB access token",
+
             "detail": str(error)
+
         }), 502
 
 
@@ -1187,582 +1144,43 @@ def acb_token_check(account):
 def acb_token_refresh(account):
 
     try:
-        token = get_acb_access_token(force_refresh=True)
+
+        token = get_acb_access_token(
+            force_refresh=True
+        )
 
         return jsonify({
+
             "status": "success",
+
             "message": "ACB token refreshed successfully",
+
             "token_obtained": bool(token),
+
             "account_number": account["account_number"],
+
             "token_type": "Bearer",
+
             "expires_in_seconds": max(
                 0,
-                int(ACB_TOKEN_EXPIRES_AT - time.monotonic())
+                int(
+                    ACB_TOKEN_EXPIRES_AT - time.monotonic()
+                )
             )
+
         }), 200
 
     except Exception as error:
+
         return jsonify({
+
             "status": "error",
+
             "message": "Unable to refresh ACB token",
+
             "detail": str(error)
+
         }), 502
-
-
-
-
-# ============================================================
-# ACB PAYMENT ORDER - BANKDEV ONE
-# FIX: acb_request_id NOT DEFINED
-# ============================================================
-
-
-@app.post("/ACB/payment-order")
-@require_api_key
-def acb_payment_order(account):
-
-    global ACB_ACCESS_TOKEN
-    global ACB_TOKEN_EXPIRES_AT
-
-    acb_request_id = None
-
-    try:
-        # 1. Nhận dữ liệu giao dịch
-        payload = request.get_json(silent=True)
-
-        if not isinstance(payload, dict):
-            return jsonify({
-                "status": "error",
-                "message": "Request body must be valid JSON"
-            }), 400
-
-        # 2. Giữ nguyên requestTrace của giao dịch
-        acb_request_id = str(
-            payload.get("requestTrace") or uuid.uuid4()
-        ).strip()
-
-        if not acb_request_id:
-            acb_request_id = str(uuid.uuid4())
-
-        payload["requestTrace"] = acb_request_id
-
-        # 3. Kiểm tra cấu trúc dữ liệu
-        request_parameters = payload.get(
-            "requestParameters"
-        )
-
-        if not isinstance(request_parameters, dict):
-            return jsonify({
-                "status": "error",
-                "message": "Missing requestParameters",
-                "request_id": acb_request_id
-            }), 400
-
-        data = request_parameters.get("data")
-
-        if not isinstance(data, dict):
-            return jsonify({
-                "status": "error",
-                "message": "Missing requestParameters.data",
-                "request_id": acb_request_id
-            }), 400
-
-        # 4. Đọc cấu hình ACB
-        payment_url = os.environ.get(
-            "ACB_PAYMENT_URL", ""
-        ).strip()
-
-        client_id = os.environ.get(
-            "ACB_HEADER_CLIENT_ID", ""
-        ).strip()
-
-        provider_id = os.environ.get(
-            "ACB_PROVIDER_ID", ""
-        ).strip()
-
-        channel = os.environ.get(
-            "ACB_CHANNEL", ""
-        ).strip()
-
-        authorization_string = os.environ.get(
-            "ACB_AUTHORIZATION_STRING", ""
-        ).strip()
-
-        authorization_id = os.environ.get(
-            "ACB_AUTHORIZATION_ID", ""
-        ).strip()
-
-        required = {
-            "ACB_PAYMENT_URL": payment_url,
-            "ACB_HEADER_CLIENT_ID": client_id,
-            "ACB_PROVIDER_ID": provider_id,
-            "ACB_CHANNEL": channel,
-            "ACB_AUTHORIZATION_STRING": authorization_string,
-            "ACB_AUTHORIZATION_ID": authorization_id
-        }
-
-        missing = [
-            name for name, value in required.items()
-            if not value
-        ]
-
-        if missing:
-            return jsonify({
-                "status": "error",
-                "message": "Missing ACB configuration",
-                "missing_variables": missing,
-                "request_id": acb_request_id
-            }), 500
-
-        # 5. Lấy Access Token hiện tại
-        token = get_acb_access_token()
-
-        if not token:
-            return jsonify({
-                "status": "error",
-                "message": "Unable to obtain ACB access token",
-                "request_id": acb_request_id
-            }), 502
-
-        # 6. Giữ nguyên thông tin Authorization trong payload
-        request_parameters["authorizations"] = [
-            {
-                "authorizationString": authorization_string,
-                "authorizationId": authorization_id
-            }
-        ]
-
-        # 7. Tạo Header
-        headers = {
-            "Authorization": "Bearer " + token,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "X-Client-ID": client_id,
-            "X-Request-ID": acb_request_id,
-            "X-Service": "Payment Order",
-            "X-Provider-ID": provider_id,
-            "X-Channel": channel
-        }
-
-        print("\n================================")
-        print("BANKDEV ONE -> ACB ONEBIZ")
-        print("PAYMENT ORDER")
-        print("================================")
-        print("Request ID:", acb_request_id)
-        print("Source:", data.get("sourceAccountNumber"))
-
-        # 8. Gửi giao dịch lần thứ nhất
-        response = requests.post(
-            payment_url,
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
-
-        # 9. Nếu ACB trả HTTP 401 thì làm mới token
-        if response.status_code == 401:
-
-            print("ACB HTTP 401: Access Token expired or invalid")
-            print("Clearing old Access Token...")
-
-            # Xóa Access Token cũ
-            with ACB_TOKEN_LOCK:
-                ACB_ACCESS_TOKEN = None
-                ACB_TOKEN_EXPIRES_AT = 0
-
-            # Gọi OAuth lấy Access Token mới
-            print("Requesting new ACB Access Token...")
-
-            new_token = get_acb_access_token(
-                force_refresh=True
-            )
-
-            if not new_token:
-                return jsonify({
-                    "status": "error",
-                    "message": "Unable to refresh ACB Access Token",
-                    "request_id": acb_request_id
-                }), 502
-
-            # Chỉ cập nhật Authorization
-            # Giữ nguyên Request ID và payload giao dịch
-            headers["Authorization"] = (
-                "Bearer " + new_token
-            )
-
-            print("New Access Token obtained successfully")
-            print("Retrying original transaction once...")
-
-            # Gửi lại đúng giao dịch ban đầu
-            response = requests.post(
-                payment_url,
-                headers=headers,
-                json=payload,
-                timeout=30
-            )
-
-        # 10. Đọc phản hồi ACB
-        try:
-            acb_result = response.json()
-
-        except ValueError:
-            acb_result = {
-                "raw_response": response.text
-            }
-
-        print("ACB HTTP:", response.status_code)
-        print("ACB RESPONSE:", acb_result)
-
-        # 11. Trả kết quả về BankDev One
-        return jsonify({
-            "status": (
-                "response_received"
-                if 200 <= response.status_code < 300
-                else "error"
-            ),
-            "message": "ACB Payment Order response",
-            "request_id": acb_request_id,
-            "bankdev_account": account["account_number"],
-            "acb_http_status": response.status_code,
-            "acb_response": acb_result,
-            "retry_performed": (
-                response.status_code == 401
-            ),
-            "requires_result_validation": True
-        }), response.status_code
-
-    except requests.Timeout:
-
-        # Tuyệt đối không tự động gửi lại khi timeout
-        return jsonify({
-            "status": "unknown",
-            "message": (
-                "ACB request timed out. "
-                "Check transaction status before retrying."
-            ),
-            "request_id": acb_request_id
-        }), 504
-
-    except requests.RequestException as error:
-
-        return jsonify({
-            "status": "error",
-            "message": "Unable to connect to ACB",
-            "detail": str(error),
-            "request_id": acb_request_id
-        }), 502
-
-    except Exception as error:
-
-        return jsonify({
-            "status": "error",
-            "message": "BankDev One ACB Payment Order error",
-            "detail": str(error),
-            "request_id": acb_request_id
-        }), 500
-
-
-# ============================================================
-# ACB ONE CONNECT - CREDIT
-# BANKDEV ONE BDO 4
-# ============================================================
-
-@app.post("/ACB/credit")
-@require_api_key
-def bankdev_acb_credit(account):
-
-    try:
-
-        # ----------------------------------------------------
-        # 1. READ REQUEST BODY
-        # ----------------------------------------------------
-
-        payload = request.get_json(silent=True)
-
-        if payload is None:
-            payload = {}
-
-        if not isinstance(payload, dict):
-            return jsonify({
-                "status": "error",
-                "message": "Request body must be a JSON object"
-            }), 400
-
-        # ----------------------------------------------------
-        # 2. VALIDATE TRANSACTION AMOUNT
-        # ----------------------------------------------------
-
-        amount = payload.get("transactionAmount", 100000)
-
-        if isinstance(amount, bool) or not isinstance(amount, int):
-            return jsonify({
-                "status": "error",
-                "message": "transactionAmount must be an integer"
-            }), 400
-
-        if amount <= 0 or amount > 500000000:
-            return jsonify({
-                "status": "error",
-                "message": "Invalid transactionAmount"
-            }), 400
-
-        # ----------------------------------------------------
-        # 3. VALIDATE DESCRIPTION
-        # ----------------------------------------------------
-
-        description = payload.get(
-            "description",
-            "NAP TIEN KIEM THU BANKDEV ONE"
-        )
-
-        if not isinstance(description, str):
-            return jsonify({
-                "status": "error",
-                "message": "description must be a string"
-            }), 400
-
-        description = description.strip()
-
-        if not description or len(description) > 255:
-            return jsonify({
-                "status": "error",
-                "message": "description must contain 1-255 characters"
-            }), 400
-
-        # ----------------------------------------------------
-        # 4. NUMBER OF TRANSACTIONS
-        # ----------------------------------------------------
-
-        number_of_transaction = payload.get(
-            "numberOfTransaction", 1
-        )
-
-        if (
-            isinstance(number_of_transaction, bool)
-            or not isinstance(number_of_transaction, int)
-            or not 1 <= number_of_transaction <= 10
-        ):
-            return jsonify({
-                "status": "error",
-                "message": "numberOfTransaction must be between 1 and 10"
-            }), 400
-
-        # ----------------------------------------------------
-        # 5. READ RENDER ENVIRONMENT VARIABLES
-        # ----------------------------------------------------
-
-        credit_url = os.environ.get(
-            "ACB_CREDIT_URL",
-            "https://sandbox.acb.com.vn/acb/open/payment/payment-execution/v1/credit"
-        ).strip()
-
-        client_id = os.environ.get(
-            "ACB_HEADER_CLIENT_ID", ""
-        ).strip()
-
-        provider_id = os.environ.get(
-            "ACB_PROVIDER_ID", "ACBS"
-        ).strip()
-
-        channel = os.environ.get(
-            "ACB_CHANNEL", "SOBA"
-        ).strip()
-
-        required = {
-            "ACB_HEADER_CLIENT_ID": client_id,
-            "ACB_PROVIDER_ID": provider_id,
-            "ACB_CHANNEL": channel
-        }
-
-        missing = [
-            key for key, value in required.items()
-            if not value
-        ]
-
-        if missing:
-            return jsonify({
-                "status": "error",
-                "message": "Missing ACB configuration",
-                "missing_variables": missing
-            }), 500
-
-        # ----------------------------------------------------
-        # 6. GET ACB OAUTH ACCESS TOKEN
-        # ----------------------------------------------------
-
-        token = get_acb_access_token()
-
-        if not token:
-            return jsonify({
-                "status": "error",
-                "message": "Unable to obtain ACB access token"
-            }), 502
-
-        # ----------------------------------------------------
-        # 7. GENERATE REQUEST ID AND REQUEST TRACE
-        # ----------------------------------------------------
-
-        request_id = str(uuid.uuid4())
-
-        request_trace = str(uuid.uuid4())
-
-        request_datetime = (
-            datetime.now(timezone.utc)
-            .isoformat(timespec="milliseconds")
-            .replace("+00:00", "Z")
-        )
-
-        # ----------------------------------------------------
-        # 8. ACB REQUEST HEADERS
-        # ----------------------------------------------------
-
-        headers = {
-            "Authorization": "Bearer " + token,
-            "X-Client-ID": client_id,
-            "X-Provider-ID": provider_id,
-            "X-Request-ID": request_id,
-            "X-Channel": channel,
-            "Accept": "application/json",
-            "Content-Type": "application/json"
-        }
-
-        # ----------------------------------------------------
-        # 9. ACB REQUEST BODY
-        # ----------------------------------------------------
-
-        acb_payload = {
-            "requestTrace": request_trace,
-            "requestDateTime": request_datetime,
-            "requestParameters": {
-                "transactionAmount": amount,
-                "description": description,
-                "numberOfTransaction": number_of_transaction
-            }
-        }
-
-        # ----------------------------------------------------
-        # 10. LOG TRANSACTION
-        # ----------------------------------------------------
-
-        print("\n======================================")
-        print("BANKDEV ONE -> ACB ONE CONNECT")
-        print("======================================")
-
-        print("Environment:", "SANDBOX")
-        print("Account:", account["account_number"])
-        print("Amount:", f"{amount:,} VND")
-        print("Request ID:", request_id)
-        print("Request Trace:", request_trace)
-        print("Request Date:", request_datetime)
-
-        print("ACB CREDIT REQUEST:")
-        print(json.dumps(
-            acb_payload,
-            ensure_ascii=False,
-            indent=4
-        ))
-
-        # ----------------------------------------------------
-        # 11. SEND REQUEST TO ACB
-        # ----------------------------------------------------
-
-        response = requests.post(
-            credit_url,
-            headers=headers,
-            json=acb_payload,
-            timeout=30
-        )
-
-        # ----------------------------------------------------
-        # 12. READ ACB RESPONSE
-        # ----------------------------------------------------
-
-        try:
-            acb_result = response.json()
-
-        except ValueError:
-            acb_result = {
-                "raw_response": response.text
-            }
-
-        response_status = (
-            acb_result.get("responseStatus", {})
-            if isinstance(acb_result, dict)
-            else {}
-        )
-
-        response_code = response_status.get(
-            "responseCode", ""
-        )
-
-        response_message = response_status.get(
-            "responseMessage", ""
-        )
-
-        # ----------------------------------------------------
-        # 13. CHECK BUSINESS RESULT
-        # ----------------------------------------------------
-
-        success = (
-            response.status_code == 200
-            and response_code == "00000000"
-        )
-
-        print("\nACB HTTP STATUS:", response.status_code)
-
-        print("ACB RESPONSE CODE:", response_code)
-
-        print("ACB RESPONSE MESSAGE:", response_message)
-
-        print("ACB RESPONSE:")
-        print(json.dumps(
-            acb_result,
-            ensure_ascii=False,
-            indent=4
-        ))
-
-        # ----------------------------------------------------
-        # 14. RETURN RESULT TO BANKDEV ONE
-        # ----------------------------------------------------
-
-        return jsonify({
-            "status": "success" if success else "failed",
-            "message": response_message,
-            "bankdev_account": account["account_number"],
-            "transaction_amount": amount,
-            "currency": "VND",
-            "request_id": request_id,
-            "request_trace": request_trace,
-            "acb_http_status": response.status_code,
-            "acb_response_code": response_code,
-            "acb_response": acb_result
-        }), 200 if success else 502
-
-    except requests.Timeout:
-
-        return jsonify({
-            "status": "unknown",
-            "message": (
-                "ACB request timeout. "
-                "Check transaction status before retrying."
-            )
-        }), 504
-
-    except requests.RequestException as error:
-
-        return jsonify({
-            "status": "error",
-            "message": "Unable to connect to ACB",
-            "detail": str(error)
-        }), 502
-
-    except Exception as error:
-
-        return jsonify({
-            "status": "error",
-            "message": "BankDev One ACB Credit error",
-            "detail": str(error)
-        }), 500
 
 
 # ============================================================
@@ -1771,9 +1189,13 @@ def bankdev_acb_credit(account):
 
 @app.errorhandler(404)
 def not_found(error):
+
     return jsonify({
+
         "status": "error",
+
         "message": "Endpoint not found"
+
     }), 404
 
 
@@ -1783,11 +1205,14 @@ def not_found(error):
 
 @app.errorhandler(405)
 def method_not_allowed(error):
-    return jsonify({
-        "status": "error",
-        "message": "HTTP method not allowed"
-    }), 405
 
+    return jsonify({
+
+        "status": "error",
+
+        "message": "HTTP method not allowed"
+
+    }), 405
 
 
 # ============================================================
