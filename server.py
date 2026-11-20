@@ -1182,6 +1182,28 @@ def acb_token_refresh(account):
 
         }), 502
 
+@app.route("/ACB/payment-order", methods=["POST"])
+def acb_payment_order():
+
+    data = request.get_json(silent=True) or {}
+
+    amount = data.get("amount")
+    account_number = data.get("account_number")
+    bank_code = data.get("bank_code")
+    request_id = data.get("request_id")
+
+    if not amount or not account_number:
+        return jsonify({
+            "status": "error",
+            "message": "Missing amount or account_number"
+        }), 400
+
+    return jsonify({
+        "status": "pending",
+        "message": "Payment order received",
+        "request_id": request_id
+    }), 202
+
 
 # ============================================================
 # 404 ERROR
