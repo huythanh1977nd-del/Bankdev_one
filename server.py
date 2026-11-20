@@ -125,9 +125,8 @@ def generate_transaction_id(prefix="TX"):
 
 def generate_account_number(conn):
     """
-    Cấp số tài khoản 8 chữ số:
-    Bắt đầu từ 51113526, sau đó tăng tuần tự.
-    Phải gọi bên trong giao dịch BEGIN IMMEDIATE.
+    Cấp số tài khoản 8 chữ số.
+    Bắt đầu từ 51113526 và tăng tuần tự.
     """
 
     row = conn.execute("""
@@ -144,16 +143,10 @@ def generate_account_number(conn):
         next_number = int(last_number) + 1
 
     if next_number > 51119999:
-        raise RuntimeError(
-            "Da het dai so tai khoan 8 chu so"
-        )
+        raise RuntimeError("Da het dai so tai khoan")
 
     return str(next_number)
 
-
-def generate_api_key():
-
-    return "sk_live_" + secrets.token_urlsafe(32)
 
 
 # ============================================================
