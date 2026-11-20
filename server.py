@@ -147,6 +147,53 @@ def generate_account_number(conn):
 
     return str(next_number)
 
+@app.post("/api/register")
+def register():
+
+    conn = get_db()
+
+    try:
+        # Khóa giao dịch để tránh cấp trùng số tài khoản
+        conn.execute("BEGIN IMMEDIATE")
+
+        account_number = generate_account_number(conn)
+
+        api_key = generate_api_key()
+
+        created_at = now_utc()
+
+        conn.execute("""
+            INSERT INTO accounts
+            (
+                account_number,
+                api_key,
+                balance,
+                created_at
+            )
+            VALUES (?, ?, 0, ?)
+        """, (
+            account_number,
+            api_key,
+            created_at
+        ))
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    return jsonify({
+        "status": "success",
+        "message": "Account created",
+        "account_number": account_number,
+        "api_key": api_key,
+        "balance": 0,
+        "created_at": created_at
+    }), 201
 
 
 # ============================================================
