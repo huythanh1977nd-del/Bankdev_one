@@ -151,7 +151,6 @@ def generate_account_number(conn):
     return str(next_number)
 
 
-
 def generate_api_key():
 
     return "sk_live_" + secrets.token_urlsafe(32)
