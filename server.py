@@ -1194,7 +1194,26 @@ def not_found(error):
 
         "status": "error",
 
-        "message": "Endpoint not found"
+        "message": "API endpoint does not exist",
+
+        "requested_path": request.path,
+
+        "requested_method": request.method,
+
+        "available_endpoints": [
+            "/",
+            "/health",
+            "/api/register",
+            "/api/deposit",
+            "/api/withdraw",
+            "/api/transfer",
+            "/api/balance",
+            "/api/transactions",
+            "/ACB/token/check",
+            "/ACB/token/refresh",
+            "/ACB/transfer",
+            "/ACB/transaction"
+        ]
 
     }), 404
 
