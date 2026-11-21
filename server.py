@@ -1182,6 +1182,7 @@ def acb_token_refresh(account):
 
         }), 502
 
+
 @app.route("/ACB/payment-order", methods=["POST"])
 def acb_payment_order():
 
@@ -1193,7 +1194,10 @@ def acb_payment_order():
             "message": "A JSON object is required"
         }), 400
 
-    # Đọc cấu trúc JSON OneBiz
+    # ========================================================
+    # 1. ĐỌC CẤU TRÚC JSON ONEBIZ
+    # ========================================================
+
     request_parameters = data.get("requestParameters") or {}
     onebiz_data = request_parameters.get("data") or {}
 
@@ -1201,35 +1205,54 @@ def acb_payment_order():
     amount_object = transaction.get("amount") or {}
 
     beneficiary = transaction.get("beneficiary") or {}
-    outside = beneficiary.get("outside") or {}
-    bank = outside.get("bank") or {}
 
-    # Lấy thông tin tài khoản nguồn
+    transaction_type = str(
+        transaction.get("transactionType", "")
+    ).strip().upper()
+
+    # ========================================================
+    # 2. LẤY THÔNG TIN TÀI KHOẢN NGUỒN
+    # ========================================================
+
     account_number = (
         onebiz_data.get("sourceAccountNumber")
         or data.get("sourceAccountNumber")
         or data.get("account_number")
     )
 
-    # Lấy số tiền trong OneBiz
+    # ========================================================
+    # 3. LẤY THÔNG TIN NGƯỜI THỤ HƯỞNG
+    # ========================================================
+
+    inside = beneficiary.get("inside") or {}
+    outside = beneficiary.get("outside") or {}
+    bank = outside.get("bank") or {}
+
+    bank_code = (
+        bank.get("code")
+        or bank.get("citadCode")
+        or bank.get("napasCode")
+        or data.get("bank_code")
+    )
+
+    # ========================================================
+    # 4. LẤY SỐ TIỀN VÀ REQUEST TRACE
+    # ========================================================
+
     raw_amount = (
         amount_object.get("amount")
         or data.get("amount")
     )
 
-    # Lấy mã yêu cầu
     request_id = (
         data.get("requestTrace")
         or data.get("request_id")
     )
 
-    bank_code = (
-        bank.get("code")
-        or bank.get("napasCode")
-        or data.get("bank_code")
-    )
+    # ========================================================
+    # 5. KIỂM TRA SỐ TIỀN
+    # ========================================================
 
-    # Kiểm tra số tiền
     try:
         if isinstance(raw_amount, bool):
             raise ValueError
@@ -1245,6 +1268,10 @@ def acb_payment_order():
             "message": "Invalid payment amount",
             "received_amount": raw_amount
         }), 400
+
+    # ========================================================
+    # 6. KIỂM TRA CẤU TRÚC ONEBIZ
+    # ========================================================
 
     if not account_number:
         return jsonify({
@@ -1264,15 +1291,75 @@ def acb_payment_order():
             "message": "Invalid OneBiz transaction structure"
         }), 400
 
-    if not outside or not bank_code:
+    if transaction_type not in ("INSIDEBANK", "OUTSIDEBANK"):
         return jsonify({
             "status": "error",
-            "message": "Missing outside-bank beneficiary information"
+            "message": "Unsupported transactionType",
+            "received_transaction_type": transaction_type
         }), 400
 
-    # URL thanh toán ACB lấy từ Render Environment
+    # ========================================================
+    # 7. KIỂM TRA NGƯỜI THỤ HƯỞNG THEO LOẠI GIAO DỊCH
+    # ========================================================
+
+    if transaction_type == "INSIDEBANK":
+
+        # Chuyển khoản nội bộ ACB
+        if not inside.get("accountNumber"):
+            return jsonify({
+                "status": "error",
+                "message": "Missing inside-bank beneficiary account"
+            }), 400
+
+        if not inside.get("beneficiaryName"):
+            return jsonify({
+                "status": "error",
+                "message": "Missing inside-bank beneficiary name"
+            }), 400
+
+    elif transaction_type == "OUTSIDEBANK":
+
+        # Chuyển khoản sang ngân hàng khác
+        if not outside.get("accountNumber"):
+            return jsonify({
+                "status": "error",
+                "message": "Missing outside-bank beneficiary account"
+            }), 400
+
+        if not outside.get("beneficiaryName"):
+            return jsonify({
+                "status": "error",
+                "message": "Missing outside-bank beneficiary name"
+            }), 400
+
+        if not bank_code:
+            return jsonify({
+                "status": "error",
+                "message": "Missing outside-bank bank code"
+            }), 400
+
+    # ========================================================
+    # 8. LẤY CẤU HÌNH ACB TỪ RENDER
+    # ========================================================
+
     acb_payment_url = os.environ.get(
         "ACB_PAYMENT_ORDER_URL", ""
+    ).strip()
+
+    acb_client_id = os.environ.get(
+        "ACB_CLIENT_ID", ""
+    ).strip()
+
+    acb_provider_id = os.environ.get(
+        "ACB_PROVIDER_ID", ""
+    ).strip()
+
+    acb_service = os.environ.get(
+        "ACB_SERVICE", ""
+    ).strip()
+
+    acb_channel = os.environ.get(
+        "ACB_CHANNEL", ""
     ).strip()
 
     if not acb_payment_url:
@@ -1281,18 +1368,50 @@ def acb_payment_order():
             "message": "ACB_PAYMENT_ORDER_URL is not configured"
         }), 503
 
+    if not acb_client_id:
+        return jsonify({
+            "status": "error",
+            "message": "ACB_CLIENT_ID is not configured"
+        }), 503
+
+    # ========================================================
+    # 9. LẤY ACB ACCESS TOKEN
+    # ========================================================
+
     try:
-        # Lấy token bằng hàm OAuth hiện có
         token = get_acb_access_token()
+
+        if not token:
+            return jsonify({
+                "status": "error",
+                "message": "Cannot obtain ACB access token"
+            }), 502
+
+        # ====================================================
+        # 10. TẠO HEADER THEO ACB ONEBIZ
+        # ====================================================
 
         headers = {
             "Authorization": "Bearer " + token,
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "X-Request-ID": str(request_id)
+            "X-Request-ID": str(request_id),
+            "X-Client-ID": acb_client_id
         }
 
-        # Giữ nguyên cấu trúc JSON OneBiz gửi sang ACB
+        if acb_provider_id:
+            headers["X-Provider-ID"] = acb_provider_id
+
+        if acb_service:
+            headers["X-Service"] = acb_service
+
+        if acb_channel:
+            headers["X-Channel"] = acb_channel
+
+        # ====================================================
+        # 11. GỬI NGUYÊN JSON ONEBIZ TỚI ACB
+        # ====================================================
+
         acb_response = requests.post(
             acb_payment_url,
             json=data,
@@ -1302,49 +1421,106 @@ def acb_payment_order():
 
         try:
             acb_result = acb_response.json()
+
         except ValueError:
             acb_result = {
                 "raw_response": acb_response.text[:3000]
             }
 
+        # ====================================================
+        # 12. ĐỌC MÃ PHẢN HỒI ACB
+        # ====================================================
+
+        response_status = {}
+
+        if isinstance(acb_result, dict):
+            response_status = (
+                acb_result.get("responseStatus") or {}
+            )
+
+        acb_response_code = response_status.get(
+            "responseCode"
+        )
+
+        acb_response_message = response_status.get(
+            "responseMessage"
+        )
+
+        # ====================================================
+        # 13. TRẢ KẾT QUẢ VỀ BANKDEV CLIENT
+        # ====================================================
+
+        if acb_response.ok:
+
+            return jsonify({
+                "status": "received",
+                "message": (
+                    "ACB returned an HTTP success response. "
+                    "Settlement is not yet confirmed."
+                ),
+                "request_id": request_id,
+                "transaction_type": transaction_type,
+                "source_account": account_number,
+                "amount": amount,
+                "bank_code": bank_code,
+                "acb_http_status": acb_response.status_code,
+                "acb_response_code": acb_response_code,
+                "acb_response_message": acb_response_message,
+                "acb_response": acb_result,
+                "final_settlement_confirmed": False
+            }), 200
+
         return jsonify({
-            "status": "success" if acb_response.ok else "error",
-            "message": (
-                "ACB received the payment-order request"
-                if acb_response.ok
-                else "ACB rejected the payment-order request"
-            ),
+            "status": "error",
+            "message": "ACB rejected the payment-order request",
             "request_id": request_id,
+            "transaction_type": transaction_type,
             "source_account": account_number,
             "amount": amount,
-            "bank_code": bank_code,
             "acb_http_status": acb_response.status_code,
             "acb_response": acb_result,
             "final_settlement_confirmed": False
-        }), 200 if acb_response.ok else 502
+        }), 502
+
+    # ========================================================
+    # 14. XỬ LÝ TIMEOUT
+    # ========================================================
 
     except requests.Timeout:
         return jsonify({
             "status": "unknown",
-            "message": "ACB request timed out. Check transaction status before retrying.",
+            "message": (
+                "ACB request timed out. "
+                "Check transaction status before retrying."
+            ),
             "request_id": request_id,
             "final_settlement_confirmed": False
         }), 504
+
+    # ========================================================
+    # 15. XỬ LÝ LỖI KẾT NỐI
+    # ========================================================
 
     except requests.RequestException as error:
         return jsonify({
             "status": "error",
             "message": "Cannot connect to ACB",
             "detail": str(error),
-            "request_id": request_id
+            "request_id": request_id,
+            "final_settlement_confirmed": False
         }), 502
+
+    # ========================================================
+    # 16. XỬ LÝ LỖI KHÁC
+    # ========================================================
 
     except Exception as error:
         return jsonify({
             "status": "error",
             "message": "Payment order processing failed",
             "detail": str(error),
-            "request_id": request_id
+            "request_id": request_id,
+            "final_settlement_confirmed": False
         }), 500
 
 # ============================================================
