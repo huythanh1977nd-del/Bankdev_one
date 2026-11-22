@@ -1182,18 +1182,11 @@ def acb_token_refresh(account):
 
         }), 502
 
-# ==========================================
-# ACB CREDIT - BANKDEV ONE
-# API: ACB Payment Execution - Credit
-# ==========================================
 
-ACB_CREDIT_URL = os.environ.get(
-    "ACB_CREDIT_URL",
-    "https://sandbox.acb.com.vn/acb/open/payment/payment-execution/v1/credit"
-)
-
-ACB_PROVIDER_ID = os.environ.get("ACB_PROVIDER_ID", "ACBS")
-ACB_CHANNEL = os.environ.get("ACB_CHANNEL", "SOBA")
+# ==========================================
+# BANKDEV ONE - ACB CREDIT
+# Chuc nang nap tien sang tai khoan ACB
+# ==========================================
 
 @app.route("/ACB/credit", methods=["POST"])
 @require_api_key
@@ -1202,6 +1195,7 @@ def acb_credit():
     try:
         data = request.get_json(silent=True) or {}
 
+        # Thong tin giao dich
         source_account = str(
             data.get("sourceAccountNumber", "")
         ).strip()
@@ -1216,7 +1210,7 @@ def acb_credit():
             data.get("description", "BANKDEV ONE CREDIT")
         ).strip()
 
-        # Kiểm tra dữ liệu
+        # Kiem tra du lieu
         if not source_account:
             return jsonify({
                 "status": "error",
@@ -1241,69 +1235,76 @@ def acb_credit():
                 "message": "Mo ta khong hop le"
             }), 400
 
-        # Lấy ACB OAuth Token tự động
+        # Lay ACB OAuth Token tu dong
         token = get_acb_access_token()
 
         if not token:
             return jsonify({
                 "status": "error",
-                "message": "Khong lay duoc ACB OAuth Token"
+                "message": "Khong lay duoc ACB Token"
             }), 502
 
-        # Tạo mã giao dịch
+        # Tao ma giao dich
         request_id = str(uuid.uuid4())
         request_trace = str(uuid.uuid4())
 
-        # Payload theo tài liệu ACB đã cung cấp
+        # Payload ACB
         payload = {
             "requestTrace": request_trace,
             "requestDateTime": datetime.now(
                 timezone.utc
-            ).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            ).isoformat(
+                timespec="milliseconds"
+            ).replace("+00:00", "Z"),
 
             "requestParameters": {
                 "transactionAmount": amount,
                 "description": description,
                 "numberOfTransaction": 1,
 
-                # TRƯỜNG GIẢ ĐỊNH:
-                # Cần ACB xác nhận tên trường tài khoản nhận.
+                # Truong tai khoan thu huong
+                # Can ACB xac nhan ten truong nay
                 "creditAccount": beneficiary_account
             }
         }
 
         headers = {
-            "Authorization": "Bearer " + token,
+            "Authorization": f"Bearer {token}",
             "X-Client-ID": ACB_CLIENT_ID,
-            "X-Provider-ID": ACB_PROVIDER_ID,
+            "X-Provider-ID": os.environ.get(
+                "ACB_PROVIDER_ID", "ACBS"
+            ),
             "X-Request-ID": request_id,
-            "X-Channel": ACB_CHANNEL,
+            "X-Channel": os.environ.get(
+                "ACB_CHANNEL", "SOBA"
+            ),
             "Accept": "application/json",
             "Content-Type": "application/json"
         }
 
-        # Gửi yêu cầu đến ACB
+        # Gui lenh den ACB
         response = requests.post(
-            ACB_CREDIT_URL,
+            os.environ.get(
+                "ACB_CREDIT_URL",
+                "https://sandbox.acb.com.vn/acb/open/payment/payment-execution/v1/credit"
+            ),
             headers=headers,
             json=payload,
             timeout=45
         )
 
         try:
-            acb_result = response.json()
+            result = response.json()
         except ValueError:
-            acb_result = {
-                "raw_response": response.text[:2000]
-            }
+            result = {"raw_response": response.text[:2000]}
 
-        response_status = (
-            acb_result.get("responseStatus", {})
-            if isinstance(acb_result, dict)
-            else {}
+        response_status = result.get(
+            "responseStatus", {}
+        ) if isinstance(result, dict) else {}
+
+        response_code = response_status.get(
+            "responseCode"
         )
-
-        response_code = response_status.get("responseCode")
 
         success = (
             response.ok
@@ -1312,27 +1313,22 @@ def acb_credit():
 
         return jsonify({
             "status": "success" if success else "failed",
-            "message": (
-                "ACB chap nhan yeu cau"
-                if success
-                else "ACB chua xac nhan thanh cong"
-            ),
             "bankdev_source_account": source_account,
             "acb_beneficiary_account": beneficiary_account,
             "amount": amount,
             "request_id": request_id,
-            "acb_http_status": response.status_code,
-            "acb_response": acb_result
+            "acb_response_code": response_code,
+            "acb_response": result
         }), 200 if success else 502
 
     except requests.exceptions.Timeout:
         return jsonify({
             "status": "unknown",
-            "message": "ACB het thoi gian phan hoi. Can kiem tra giao dich truoc khi gui lai."
+            "message": "ACB timeout. Can kiem tra giao dich truoc khi gui lai."
         }), 504
 
     except Exception as e:
-        app.logger.exception("ACB Credit error")
+        app.logger.exception("ACB CREDIT ERROR")
 
         return jsonify({
             "status": "error",
