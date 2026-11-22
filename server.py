@@ -538,6 +538,86 @@ def create_acb_payment_order(
         }
 
 
+# ============================================================
+# API ROUTE: BANKDEV ONE -> ACB ONEBIZ
+# ============================================================
+
+@app.post("/api/acb/payment-order")
+@require_api_key
+def acb_payment_order():
+
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({
+            "status": "error",
+            "message": "Invalid JSON"
+        }), 400
+
+    try:
+        transaction = data["requestParameters"]["data"]["transaction"]
+
+        beneficiary = transaction["beneficiary"]["outside"]
+
+        amount = transaction["amount"]["amount"]
+
+        request_id = data.get("requestTrace")
+
+        destination_account = beneficiary["accountNumber"]
+
+        beneficiary_name = beneficiary["beneficiaryName"]
+
+        remarks = transaction.get(
+            "remarks",
+            "Chuyen tien den ngan hang"
+        )
+
+        if not request_id:
+            return jsonify({
+                "status": "error",
+                "message": "Missing requestTrace"
+            }), 400
+
+        amount = int(amount)
+
+        if amount <= 0:
+            return jsonify({
+                "status": "error",
+                "message": "Invalid amount"
+            }), 400
+
+        result = create_acb_payment_order(
+            destination_account=destination_account,
+            beneficiary_name=beneficiary_name,
+            amount=amount,
+            request_id=request_id,
+            remarks=remarks
+        )
+
+        return jsonify({
+            "status": "success",
+            "message": "ACB payment order request processed",
+            "acb_http_status": result.get("http_status"),
+            "acb_response": result.get("response"),
+            "request_id": request_id,
+            "payment_status": result.get("status")
+        }), 200
+
+    except (KeyError, TypeError, ValueError) as error:
+
+        return jsonify({
+            "status": "error",
+            "message": "Invalid payment request",
+            "detail": str(error)
+        }), 400
+
+    except RuntimeError as error:
+
+        return jsonify({
+            "status": "error",
+            "message": str(error)
+        }), 503
+
 
 # ============================================================
 # HOME
