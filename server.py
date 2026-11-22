@@ -545,37 +545,22 @@ def create_acb_payment_order(
 
 @app.get("/")
 def home():
-
     return jsonify({
-
         "name": PROGRAM_NAME,
-
         "version": PROGRAM_VERSION,
-
         "status": "online",
-
         "message": "BankDev One API is running",
-
         "services": {
-
             "register": "/api/register",
-
             "deposit": "/api/deposit",
-
             "withdraw": "/api/withdraw",
-
             "transfer": "/api/transfer",
-
             "balance": "/api/balance",
-
             "transactions": "/api/transactions",
-
             "acb_token_check": "/ACB/token/check",
-
+            "acb_payment_order": "/api/acb/payment-order",
             "health": "/health"
-
         }
-
     })
 
 
