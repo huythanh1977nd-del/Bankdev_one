@@ -41,6 +41,29 @@ ACB_TOKEN_EXPIRES_AT = 0
 
 ACB_TOKEN_LOCK = threading.Lock()
 
+# ============================================================
+# ACB ONEBIZ PAYMENT ORDER CONFIGURATION
+# ============================================================
+
+ACB_PAYMENT_ORDER_URL = os.environ.get(
+    "ACB_PAYMENT_ORDER_URL", ""
+).strip()
+
+ACB_SOURCE_ACCOUNT = os.environ.get(
+    "ACB_SOURCE_ACCOUNT", ""
+).strip()
+
+ACB_BANK_CODE = os.environ.get(
+    "ACB_BANK_CODE", "970416"
+).strip()
+
+ACB_CITAD_CODE = os.environ.get(
+    "ACB_CITAD_CODE", "79307001"
+).strip()
+
+ACB_NAPAS_CODE = os.environ.get(
+    "ACB_NAPAS_CODE", "970416"
+).strip()
 
 # ============================================================
 # DATABASE
@@ -356,6 +379,164 @@ def acb_headers(extra_headers=None):
         headers.update(extra_headers)
 
     return headers
+
+
+# ============================================================
+# ACB ONEBIZ - OUTSIDE BANK PAYMENT ORDER
+# ============================================================
+
+def create_acb_payment_order(
+    destination_account,
+    beneficiary_name,
+    amount,
+    request_id=None,
+    remarks="Chuyen tien den ngan hang"
+):
+    """
+    Submit an ACB OneBiz outside-bank transfer order.
+
+    Requires the official ACB Sandbox endpoint and
+    the request schema specified by ACB.
+    """
+
+    import uuid
+
+    if not ACB_PAYMENT_ORDER_URL:
+        raise RuntimeError(
+            "Missing ACB_PAYMENT_ORDER_URL"
+        )
+
+    if not ACB_SOURCE_ACCOUNT:
+        raise RuntimeError(
+            "Missing ACB_SOURCE_ACCOUNT"
+        )
+
+    amount = int(amount)
+
+    if amount <= 0:
+        raise ValueError("Amount must be positive")
+
+    destination_account = str(
+        destination_account
+    ).strip()
+
+    beneficiary_name = str(
+        beneficiary_name
+    ).strip()
+
+    if not destination_account or not beneficiary_name:
+        raise ValueError(
+            "Beneficiary information is required"
+        )
+
+    request_id = request_id or str(uuid.uuid4())
+
+    transaction_trace = str(uuid.uuid4())
+
+    request_body = {
+        "requestTrace": request_id,
+
+        "requestDateTime": datetime.now(
+            timezone.utc
+        ).isoformat(timespec="milliseconds").replace(
+            "+00:00", "Z"
+        ),
+
+        "requestParameters": {
+            "data": {
+                "sourceAccountNumber": ACB_SOURCE_ACCOUNT,
+
+                "transaction": {
+                    "transactionType": "OUTSIDEBANK",
+
+                    "beneficiary": {
+                        "outside": {
+                            "accountNumber": destination_account,
+
+                            "beneficiaryName": beneficiary_name,
+
+                            "bank": {
+                                "code": ACB_BANK_CODE,
+                                "citadCode": ACB_CITAD_CODE,
+                                "napasCode": ACB_NAPAS_CODE
+                            }
+                        }
+                    },
+
+                    "amount": {
+                        "sourceCurrency": "VND",
+                        "targetCurrency": "VND",
+                        "amount": str(amount),
+                        "exchangeRate": "1",
+                        "exchangeAmount": str(amount)
+                    },
+
+                    "remarks": remarks,
+
+                    "transactionTraceNumber": transaction_trace
+                },
+
+                "attributes": [
+                    {
+                        "name": "userName",
+                        "value": beneficiary_name
+                    }
+                ]
+            }
+        }
+    }
+
+    headers = acb_headers({
+        "X-Request-ID": request_id
+    })
+
+    try:
+        response = requests.post(
+            ACB_PAYMENT_ORDER_URL,
+            json=request_body,
+            headers=headers,
+            timeout=45
+        )
+
+        try:
+            result = response.json()
+        except ValueError:
+            result = {
+                "raw_response": response.text[:2000]
+            }
+
+        print("===== ACB ONEBIZ PAYMENT ORDER =====")
+        print("HTTP:", response.status_code)
+        print("Request ID:", request_id)
+        print("Response:", result)
+
+        # Never interpret HTTP 200 alone as a completed transfer.
+        return {
+            "status": (
+                "submitted"
+                if response.ok
+                else "http_error"
+            ),
+            "http_status": response.status_code,
+            "request_id": request_id,
+            "transaction_trace_number": transaction_trace,
+            "response": result
+        }
+
+    except requests.exceptions.Timeout:
+        return {
+            "status": "unknown",
+            "request_id": request_id,
+            "message": "ACB request timed out. Reconcile before retrying."
+        }
+
+    except requests.exceptions.RequestException as error:
+        return {
+            "status": "unknown",
+            "request_id": request_id,
+            "message": type(error).__name__
+        }
+
 
 
 # ============================================================
@@ -1180,6 +1361,118 @@ def acb_token_refresh(account):
 
             "detail": str(error)
 
+        }), 502
+
+
+# ============================================================
+# BANKDEV ONE - ACB PAYMENT ORDER API
+# ============================================================
+
+@app.post("/api/acb/payment-order")
+@require_api_key
+def bankdev_acb_payment_order(account):
+
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return jsonify({
+            "status": "error",
+            "message": "JSON body is required"
+        }), 400
+
+    try:
+        amount = int(data.get("amount"))
+    except (TypeError, ValueError):
+        return jsonify({
+            "status": "error",
+            "message": "Invalid amount"
+        }), 400
+
+    if amount <= 0:
+        return jsonify({
+            "status": "error",
+            "message": "Amount must be positive"
+        }), 400
+
+    destination = str(
+        data.get("destination_account", "")
+    ).strip()
+
+    beneficiary = str(
+        data.get("beneficiary_name", "")
+    ).strip()
+
+    if not destination or not beneficiary:
+        return jsonify({
+            "status": "error",
+            "message": "Beneficiary information required"
+        }), 400
+
+    request_id = str(
+        data.get("request_id", "")
+    ).strip()
+
+    if not request_id:
+        import uuid
+        request_id = str(uuid.uuid4())
+
+    # Check available BankDev balance.
+    conn = get_db()
+
+    try:
+        row = conn.execute(
+            """
+            SELECT balance
+            FROM accounts
+            WHERE account_number = ?
+            """,
+            (account["account_number"],)
+        ).fetchone()
+
+        if row is None:
+            return jsonify({
+                "status": "error",
+                "message": "Account not found"
+            }), 404
+
+        if amount > row["balance"]:
+            return jsonify({
+                "status": "error",
+                "message": "Insufficient balance",
+                "balance": row["balance"]
+            }), 400
+
+    finally:
+        conn.close()
+
+    # Submit the ACB order.
+    try:
+        result = create_acb_payment_order(
+            destination_account=destination,
+            beneficiary_name=beneficiary,
+            amount=amount,
+            request_id=request_id,
+            remarks=data.get(
+                "remarks",
+                "Chuyen tien den ngan hang"
+            )
+        )
+
+        return jsonify({
+            "status": result["status"],
+            "message": "ACB Payment Order response received",
+            "account_number": account["account_number"],
+            "destination_account": destination,
+            "amount": amount,
+            "request_id": request_id,
+            "acb_result": result
+        }), 200
+
+    except Exception as error:
+        return jsonify({
+            "status": "error",
+            "message": str(error),
+            "request_id": request_id
         }), 502
 
 
