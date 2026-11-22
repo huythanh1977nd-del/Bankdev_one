@@ -596,23 +596,22 @@ def acb_payment_order():
 
         http_status = result.get("http_status")
 
-if result.get("status") == "unknown":
-    return jsonify({
-        "status": "unknown",
-        "message": result.get("message"),
-        "request_id": request_id,
-        "payment_status": "reconcile_required"
-    }), 504
+         if result.get("status") == "unknown":
+             return jsonify({
+                  "status": "unknown",
+                  "message": result.get("message"),
+                  "request_id": request_id,
+                  "payment_status": "reconcile_required"
+         }), 504
 
-return jsonify({
-    "status": "success" if result.get("status") == "submitted" else "error",
-    "message": "ACB response received",
-    "acb_http_status": http_status,
-    "acb_response": result.get("response"),
-    "request_id": request_id,
-    "payment_status": result.get("status")
-}), 200
-
+             return jsonify({
+                  "status": "success" if result.get("status") == "submitted" else "error",
+                  "message": "ACB response received",
+                  "acb_http_status": http_status,
+                   "acb_response": result.get("response"),
+                   "request_id": request_id,
+                   "payment_status": result.get("status")
+          }), 200
 
     except (KeyError, TypeError, ValueError) as error:
 
