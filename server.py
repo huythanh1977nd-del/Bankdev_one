@@ -1,12 +1,15 @@
 import os
 import time
 import secrets
-import sqlite3
+import hashlib
 import threading
+import uuid
 import requests
+import psycopg
 
 from datetime import datetime, timezone
 from functools import wraps
+from psycopg.rows import dict_row
 from flask import Flask, request, jsonify
 
 
@@ -16,10 +19,10 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-DATABASE = os.environ.get("DATABASE_PATH", "bank.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
 PROGRAM_NAME = "BANKDEV ONE"
-PROGRAM_VERSION = "2.0.0"
+PROGRAM_VERSION = "3.0.0"
 
 
 # ============================================================
@@ -30,8 +33,6 @@ ACB_CLIENT_ID = os.environ.get("ACB_CLIENT_ID", "").strip()
 ACB_CLIENT_SECRET = os.environ.get("ACB_CLIENT_SECRET", "").strip()
 ACB_TOKEN_URL = os.environ.get("ACB_TOKEN_URL", "").strip()
 
-# body = client_id/client_secret trong form body
-# basic = HTTP Basic Authentication
 ACB_TOKEN_AUTH_METHOD = os.environ.get(
     "ACB_TOKEN_AUTH_METHOD", "body"
 ).strip().lower()
@@ -40,6 +41,7 @@ ACB_ACCESS_TOKEN = None
 ACB_TOKEN_EXPIRES_AT = 0
 
 ACB_TOKEN_LOCK = threading.Lock()
+
 
 # ============================================================
 # ACB ONEBIZ PAYMENT ORDER CONFIGURATION
@@ -65,70 +67,90 @@ ACB_NAPAS_CODE = os.environ.get(
     "ACB_NAPAS_CODE", "970416"
 ).strip()
 
+
 # ============================================================
-# DATABASE
+# NEON POSTGRESQL DATABASE
 # ============================================================
 
 def get_db():
 
-    conn = sqlite3.connect(
-        DATABASE,
-        timeout=30
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not configured"
+        )
+
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+        connect_timeout=15,
+        sslmode="require"
     )
-
-    conn.row_factory = sqlite3.Row
-
-    return conn
 
 
 def init_db():
 
     conn = get_db()
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS accounts (
+    try:
 
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS accounts (
 
-            account_number TEXT UNIQUE NOT NULL,
+                id BIGSERIAL PRIMARY KEY,
 
-            api_key TEXT UNIQUE NOT NULL,
+                account_number TEXT UNIQUE NOT NULL,
 
-            balance INTEGER NOT NULL DEFAULT 0,
+                api_key_hash TEXT UNIQUE NOT NULL,
 
-            created_at TEXT NOT NULL
+                balance BIGINT NOT NULL DEFAULT 0,
 
-        )
-    """)
+                created_at TEXT NOT NULL
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
+            )
+        """)
 
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
 
-            transaction_id TEXT UNIQUE NOT NULL,
+                id BIGSERIAL PRIMARY KEY,
 
-            account_number TEXT NOT NULL,
+                transaction_id TEXT UNIQUE NOT NULL,
 
-            transaction_type TEXT NOT NULL,
+                account_number TEXT NOT NULL,
 
-            amount INTEGER NOT NULL,
+                transaction_type TEXT NOT NULL,
 
-            balance_after INTEGER NOT NULL,
+                amount BIGINT NOT NULL,
 
-            description TEXT,
+                balance_after BIGINT NOT NULL,
 
-            created_at TEXT NOT NULL
+                description TEXT,
 
-        )
-    """)
+                created_at TEXT NOT NULL
 
-    conn.commit()
-    conn.close()
+            )
+        """)
+
+        conn.commit()
+
+        print("===================================")
+        print("BANKDEV ONE")
+        print("NEON POSTGRESQL: CONNECTED")
+        print("DATABASE: READY")
+        print("===================================")
+
+    except Exception:
+
+        conn.rollback()
+        raise
+
+    finally:
+
+        conn.close()
 
 
 # ============================================================
-# HELPER
+# HELPER FUNCTIONS
 # ============================================================
 
 def now_utc():
@@ -155,16 +177,17 @@ def generate_account_number():
 
         conn = get_db()
 
-        exists = conn.execute(
-            """
-            SELECT 1
-            FROM accounts
-            WHERE account_number = ?
-            """,
-            (number,)
-        ).fetchone()
+        try:
 
-        conn.close()
+            exists = conn.execute("""
+                SELECT 1
+                FROM accounts
+                WHERE account_number = %s
+            """, (number,)).fetchone()
+
+        finally:
+
+            conn.close()
 
         if not exists:
             return number
@@ -173,6 +196,13 @@ def generate_account_number():
 def generate_api_key():
 
     return "sk_live_" + secrets.token_urlsafe(32)
+
+
+def hash_api_key(api_key):
+
+    return hashlib.sha256(
+        api_key.encode("utf-8")
+    ).hexdigest()
 
 
 # ============================================================
@@ -195,16 +225,19 @@ def require_api_key(func):
 
         conn = get_db()
 
-        account = conn.execute(
-            """
-            SELECT *
-            FROM accounts
-            WHERE api_key = ?
-            """,
-            (api_key,)
-        ).fetchone()
+        try:
 
-        conn.close()
+            account = conn.execute("""
+                SELECT *
+                FROM accounts
+                WHERE api_key_hash = %s
+            """, (
+                hash_api_key(api_key),
+            )).fetchone()
+
+        finally:
+
+            conn.close()
 
         if not account:
 
@@ -231,7 +264,6 @@ def get_acb_access_token(force_refresh=False):
 
         current_time = time.monotonic()
 
-        # Reuse existing token
         if (
             not force_refresh
             and ACB_ACCESS_TOKEN
@@ -240,17 +272,13 @@ def get_acb_access_token(force_refresh=False):
 
             return ACB_ACCESS_TOKEN
 
-        # Check configuration
         if not ACB_CLIENT_ID:
-
             raise RuntimeError("Missing ACB_CLIENT_ID")
 
         if not ACB_CLIENT_SECRET:
-
             raise RuntimeError("Missing ACB_CLIENT_SECRET")
 
         if not ACB_TOKEN_URL:
-
             raise RuntimeError("Missing ACB_TOKEN_URL")
 
         if ACB_TOKEN_AUTH_METHOD not in ("body", "basic"):
@@ -259,7 +287,6 @@ def get_acb_access_token(force_refresh=False):
                 "ACB_TOKEN_AUTH_METHOD must be body or basic"
             )
 
-        # OAuth form
         payload = {
             "grant_type": "client_credentials"
         }
@@ -295,12 +322,6 @@ def get_acb_access_token(force_refresh=False):
 
             if not response.ok:
 
-                print(
-                    "ACB OAuth HTTP error:",
-                    response.status_code
-                )
-
-                # Do not expose credentials or token
                 raise RuntimeError(
                     f"ACB OAuth returned HTTP {response.status_code}"
                 )
@@ -318,26 +339,19 @@ def get_acb_access_token(force_refresh=False):
             expires_in = result.get("expires_in", 300)
 
             try:
-
                 expires_in = max(1, int(expires_in))
-
             except (TypeError, ValueError):
-
                 expires_in = 300
 
-            # Save token in memory
             ACB_ACCESS_TOKEN = access_token
 
             ACB_TOKEN_EXPIRES_AT = (
                 time.monotonic() + expires_in
             )
 
-            print("===================================")
-            print("BANKDEV ONE - ACB OAUTH")
-            print("Token status: SUCCESS")
+            print("ACB OAUTH: SUCCESS")
             print("Token obtained automatically")
-            print("Expires in:", expires_in, "seconds")
-            print("===================================")
+            print("Expires in:", expires_in)
 
             return ACB_ACCESS_TOKEN
 
@@ -357,7 +371,7 @@ def get_acb_access_token(force_refresh=False):
 
             raise RuntimeError(
                 "ACB returned invalid JSON"
-            ) from None
+            )
 
 
 # ============================================================
@@ -375,7 +389,6 @@ def acb_headers(extra_headers=None):
     }
 
     if extra_headers:
-
         headers.update(extra_headers)
 
     return headers
@@ -392,14 +405,6 @@ def create_acb_payment_order(
     request_id=None,
     remarks="Chuyen tien den ngan hang"
 ):
-    """
-    Submit an ACB OneBiz outside-bank transfer order.
-
-    Requires the official ACB Sandbox endpoint and
-    the request schema specified by ACB.
-    """
-
-    import uuid
 
     if not ACB_PAYMENT_ORDER_URL:
         raise RuntimeError(
@@ -434,23 +439,29 @@ def create_acb_payment_order(
     transaction_trace = str(uuid.uuid4())
 
     request_body = {
+
         "requestTrace": request_id,
 
         "requestDateTime": datetime.now(
             timezone.utc
-        ).isoformat(timespec="milliseconds").replace(
-            "+00:00", "Z"
-        ),
+        ).isoformat(
+            timespec="milliseconds"
+        ).replace("+00:00", "Z"),
 
         "requestParameters": {
+
             "data": {
+
                 "sourceAccountNumber": ACB_SOURCE_ACCOUNT,
 
                 "transaction": {
+
                     "transactionType": "OUTSIDEBANK",
 
                     "beneficiary": {
+
                         "outside": {
+
                             "accountNumber": destination_account,
 
                             "beneficiaryName": beneficiary_name,
@@ -491,6 +502,7 @@ def create_acb_payment_order(
     })
 
     try:
+
         response = requests.post(
             ACB_PAYMENT_ORDER_URL,
             json=request_body,
@@ -505,25 +517,29 @@ def create_acb_payment_order(
                 "raw_response": response.text[:2000]
             }
 
-        print("===== ACB ONEBIZ PAYMENT ORDER =====")
+        print("ACB PAYMENT ORDER")
         print("HTTP:", response.status_code)
         print("Request ID:", request_id)
-        print("Response:", result)
 
-        # Never interpret HTTP 200 alone as a completed transfer.
         return {
+
             "status": (
                 "submitted"
                 if response.ok
                 else "http_error"
             ),
+
             "http_status": response.status_code,
+
             "request_id": request_id,
+
             "transaction_trace_number": transaction_trace,
+
             "response": result
         }
 
     except requests.exceptions.Timeout:
+
         return {
             "status": "unknown",
             "request_id": request_id,
@@ -531,6 +547,7 @@ def create_acb_payment_order(
         }
 
     except requests.exceptions.RequestException as error:
+
         return {
             "status": "unknown",
             "request_id": request_id,
@@ -549,17 +566,19 @@ def acb_payment_order(account):
     data = request.get_json(silent=True)
 
     if not isinstance(data, dict):
+
         return jsonify({
             "status": "error",
             "message": "Invalid JSON"
         }), 400
 
     try:
+
         transaction = data["requestParameters"]["data"]["transaction"]
 
         beneficiary = transaction["beneficiary"]["outside"]
 
-        amount = transaction["amount"]["amount"]
+        amount = int(transaction["amount"]["amount"])
 
         request_id = data.get("requestTrace")
 
@@ -573,14 +592,14 @@ def acb_payment_order(account):
         )
 
         if not request_id:
+
             return jsonify({
                 "status": "error",
                 "message": "Missing requestTrace"
             }), 400
 
-        amount = int(amount)
-
         if amount <= 0:
+
             return jsonify({
                 "status": "error",
                 "message": "Invalid amount"
@@ -594,9 +613,8 @@ def acb_payment_order(account):
             remarks=remarks
         )
 
-        http_status = result.get("http_status")
-
         if result.get("status") == "unknown":
+
             return jsonify({
                 "status": "unknown",
                 "message": result.get("message"),
@@ -605,20 +623,30 @@ def acb_payment_order(account):
             }), 504
 
         return jsonify({
-            "status": "success" if result.get("status") == "submitted" else "error",
+
+            "status": (
+                "success"
+                if result.get("status") == "submitted"
+                else "error"
+            ),
+
             "message": "ACB response received",
-            "acb_http_status": http_status,
+
+            "acb_http_status": result.get("http_status"),
+
             "acb_response": result.get("response"),
+
             "request_id": request_id,
+
             "payment_status": result.get("status")
+
         }), 200
 
-    except (KeyError, TypeError, ValueError) as error:
+    except (KeyError, TypeError, ValueError):
 
         return jsonify({
             "status": "error",
-            "message": "Invalid payment request",
-            "detail": str(error)
+            "message": "Invalid payment request"
         }), 400
 
     except RuntimeError as error:
@@ -635,20 +663,37 @@ def acb_payment_order(account):
 
 @app.get("/")
 def home():
+
     return jsonify({
+
         "name": PROGRAM_NAME,
+
         "version": PROGRAM_VERSION,
+
         "status": "online",
+
         "message": "BankDev One API is running",
+
+        "database": "Neon PostgreSQL",
+
         "services": {
+
             "register": "/api/register",
+
             "deposit": "/api/deposit",
+
             "withdraw": "/api/withdraw",
+
             "transfer": "/api/transfer",
+
             "balance": "/api/balance",
+
             "transactions": "/api/transactions",
+
             "acb_token_check": "/ACB/token/check",
+
             "acb_payment_order": "/api/acb/payment-order",
+
             "health": "/health"
         }
     })
@@ -661,6 +706,22 @@ def home():
 @app.get("/health")
 def health():
 
+    database_status = "disconnected"
+
+    try:
+
+        conn = get_db()
+
+        conn.execute("SELECT 1")
+
+        conn.close()
+
+        database_status = "connected"
+
+    except Exception:
+
+        database_status = "disconnected"
+
     return jsonify({
 
         "status": "online",
@@ -669,14 +730,13 @@ def health():
 
         "version": PROGRAM_VERSION,
 
-        "database": "configured",
+        "database": database_status,
 
         "acb_oauth_configured": bool(
             ACB_CLIENT_ID
             and ACB_CLIENT_SECRET
             and ACB_TOKEN_URL
         )
-
     })
 
 
@@ -701,18 +761,23 @@ def register():
             INSERT INTO accounts
             (
                 account_number,
-                api_key,
+                api_key_hash,
                 balance,
                 created_at
             )
-            VALUES (?, ?, 0, ?)
+            VALUES (%s, %s, 0, %s)
         """, (
             account_number,
-            api_key,
+            hash_api_key(api_key),
             created_at
         ))
 
         conn.commit()
+
+    except Exception:
+
+        conn.rollback()
+        raise
 
     finally:
 
@@ -753,9 +818,7 @@ def deposit(account):
         }), 400
 
     try:
-
         amount = int(data.get("amount"))
-
     except (TypeError, ValueError):
 
         return jsonify({
@@ -782,16 +845,15 @@ def deposit(account):
 
     try:
 
-        conn.execute("BEGIN IMMEDIATE")
-
-        row = conn.execute(
-            """
-            SELECT balance
-            FROM accounts
-            WHERE account_number = ?
-            """,
-            (account["account_number"],)
-        ).fetchone()
+        row = conn.execute("""
+            UPDATE accounts
+            SET balance = balance + %s
+            WHERE account_number = %s
+            RETURNING balance
+        """, (
+            amount,
+            account["account_number"]
+        )).fetchone()
 
         if row is None:
 
@@ -802,19 +864,7 @@ def deposit(account):
                 "message": "Account not found"
             }), 404
 
-        new_balance = row["balance"] + amount
-
-        conn.execute(
-            """
-            UPDATE accounts
-            SET balance = ?
-            WHERE account_number = ?
-            """,
-            (
-                new_balance,
-                account["account_number"]
-            )
-        )
+        new_balance = row["balance"]
 
         conn.execute("""
             INSERT INTO transactions
@@ -827,7 +877,7 @@ def deposit(account):
                 description,
                 created_at
             )
-            VALUES (?, ?, 'DEPOSIT', ?, ?, ?, ?)
+            VALUES (%s, %s, 'DEPOSIT', %s, %s, %s, %s)
         """, (
             transaction_id,
             account["account_number"],
@@ -887,9 +937,7 @@ def withdraw(account):
         }), 400
 
     try:
-
         amount = int(data.get("amount"))
-
     except (TypeError, ValueError):
 
         return jsonify({
@@ -916,57 +964,46 @@ def withdraw(account):
 
     try:
 
-        conn.execute("BEGIN IMMEDIATE")
-
-        row = conn.execute(
-            """
-            SELECT balance
-            FROM accounts
-            WHERE account_number = ?
-            """,
-            (account["account_number"],)
-        ).fetchone()
+        row = conn.execute("""
+            UPDATE accounts
+            SET balance = balance - %s
+            WHERE account_number = %s
+            AND balance >= %s
+            RETURNING balance
+        """, (
+            amount,
+            account["account_number"],
+            amount
+        )).fetchone()
 
         if row is None:
 
-            conn.rollback()
-
-            return jsonify({
-                "status": "error",
-                "message": "Account not found"
-            }), 404
-
-        current_balance = row["balance"]
-
-        if amount > current_balance:
+            exists = conn.execute("""
+                SELECT 1
+                FROM accounts
+                WHERE account_number = %s
+            """, (
+                account["account_number"],
+            )).fetchone()
 
             conn.rollback()
 
+            if not exists:
+
+                return jsonify({
+                    "status": "error",
+                    "message": "Account not found"
+                }), 404
+
             return jsonify({
 
                 "status": "error",
 
-                "message": "Insufficient balance",
-
-                "balance": current_balance,
-
-                "requested_amount": amount
+                "message": "Insufficient balance"
 
             }), 400
 
-        new_balance = current_balance - amount
-
-        conn.execute(
-            """
-            UPDATE accounts
-            SET balance = ?
-            WHERE account_number = ?
-            """,
-            (
-                new_balance,
-                account["account_number"]
-            )
-        )
+        new_balance = row["balance"]
 
         conn.execute("""
             INSERT INTO transactions
@@ -979,7 +1016,7 @@ def withdraw(account):
                 description,
                 created_at
             )
-            VALUES (?, ?, 'WITHDRAW', ?, ?, ?, ?)
+            VALUES (%s, %s, 'WITHDRAW', %s, %s, %s, %s)
         """, (
             transaction_id,
             account["account_number"],
@@ -1050,9 +1087,7 @@ def transfer(account):
     to_account = str(to_account).strip()
 
     try:
-
         amount = int(data.get("amount"))
-
     except (TypeError, ValueError):
 
         return jsonify({
@@ -1082,22 +1117,43 @@ def transfer(account):
 
     transaction_id = generate_transaction_id("TR")
 
+    receiver_transaction_id = generate_transaction_id("TR")
+
     created_at = now_utc()
 
     conn = get_db()
 
     try:
 
-        conn.execute("BEGIN IMMEDIATE")
-
-        receiver = conn.execute(
-            """
+        # Lock both accounts in a consistent order.
+        locked_accounts = conn.execute("""
             SELECT account_number, balance
             FROM accounts
-            WHERE account_number = ?
-            """,
-            (to_account,)
-        ).fetchone()
+            WHERE account_number IN (%s, %s)
+            ORDER BY account_number
+            FOR UPDATE
+        """, (
+            from_account,
+            to_account
+        )).fetchall()
+
+        account_map = {
+            row["account_number"]: row
+            for row in locked_accounts
+        }
+
+        sender = account_map.get(from_account)
+
+        receiver = account_map.get(to_account)
+
+        if sender is None:
+
+            conn.rollback()
+
+            return jsonify({
+                "status": "error",
+                "message": "Sender account not found"
+            }), 404
 
         if receiver is None:
 
@@ -1107,24 +1163,6 @@ def transfer(account):
                 "status": "error",
                 "message": "Receiver account not found",
                 "to_account": to_account
-            }), 404
-
-        sender = conn.execute(
-            """
-            SELECT balance
-            FROM accounts
-            WHERE account_number = ?
-            """,
-            (from_account,)
-        ).fetchone()
-
-        if sender is None:
-
-            conn.rollback()
-
-            return jsonify({
-                "status": "error",
-                "message": "Sender account not found"
             }), 404
 
         sender_balance = sender["balance"]
@@ -1149,33 +1187,24 @@ def transfer(account):
 
         receiver_new_balance = receiver["balance"] + amount
 
-        # Update sender
-        conn.execute(
-            """
+        conn.execute("""
             UPDATE accounts
-            SET balance = ?
-            WHERE account_number = ?
-            """,
-            (
-                sender_new_balance,
-                from_account
-            )
-        )
+            SET balance = %s
+            WHERE account_number = %s
+        """, (
+            sender_new_balance,
+            from_account
+        ))
 
-        # Update receiver
-        conn.execute(
-            """
+        conn.execute("""
             UPDATE accounts
-            SET balance = ?
-            WHERE account_number = ?
-            """,
-            (
-                receiver_new_balance,
-                to_account
-            )
-        )
+            SET balance = %s
+            WHERE account_number = %s
+        """, (
+            receiver_new_balance,
+            to_account
+        ))
 
-        # Sender transaction
         conn.execute("""
             INSERT INTO transactions
             (
@@ -1187,7 +1216,7 @@ def transfer(account):
                 description,
                 created_at
             )
-            VALUES (?, ?, 'TRANSFER_OUT', ?, ?, ?, ?)
+            VALUES (%s, %s, 'TRANSFER_OUT', %s, %s, %s, %s)
         """, (
             transaction_id,
             from_account,
@@ -1197,9 +1226,6 @@ def transfer(account):
             created_at
         ))
 
-        # Receiver transaction
-        receiver_transaction_id = generate_transaction_id("TR")
-
         conn.execute("""
             INSERT INTO transactions
             (
@@ -1211,7 +1237,7 @@ def transfer(account):
                 description,
                 created_at
             )
-            VALUES (?, ?, 'TRANSFER_IN', ?, ?, ?, ?)
+            VALUES (%s, %s, 'TRANSFER_IN', %s, %s, %s, %s)
         """, (
             receiver_transaction_id,
             to_account,
@@ -1269,14 +1295,13 @@ def balance(account):
 
     try:
 
-        row = conn.execute(
-            """
+        row = conn.execute("""
             SELECT balance
             FROM accounts
-            WHERE account_number = ?
-            """,
-            (account["account_number"],)
-        ).fetchone()
+            WHERE account_number = %s
+        """, (
+            account["account_number"],
+        )).fetchone()
 
     finally:
 
@@ -1321,7 +1346,7 @@ def transactions(account):
                 description,
                 created_at
             FROM transactions
-            WHERE account_number = ?
+            WHERE account_number = %s
             ORDER BY id DESC
         """, (
             account["account_number"],
@@ -1378,15 +1403,13 @@ def acb_token_check(account):
 
         }), 200
 
-    except Exception as error:
+    except Exception:
 
         return jsonify({
 
             "status": "error",
 
-            "message": "Unable to obtain ACB access token",
-
-            "detail": str(error)
+            "message": "Unable to obtain ACB access token"
 
         }), 502
 
@@ -1426,15 +1449,13 @@ def acb_token_refresh(account):
 
         }), 200
 
-    except Exception as error:
+    except Exception:
 
         return jsonify({
 
             "status": "error",
 
-            "message": "Unable to refresh ACB token",
-
-            "detail": str(error)
+            "message": "Unable to refresh ACB token"
 
         }), 502
 
@@ -1472,7 +1493,7 @@ def method_not_allowed(error):
 
 
 # ============================================================
-# DATABASE INIT
+# DATABASE INITIALIZATION
 # ============================================================
 
 init_db()
@@ -1484,12 +1505,10 @@ init_db()
 
 if __name__ == "__main__":
 
-    app.run(
+    from waitress import serve
 
+    serve(
+        app,
         host="0.0.0.0",
-
-        port=int(
-            os.environ.get("PORT", 8080)
-        )
-
+        port=int(os.environ.get("PORT", 8080))
     )
