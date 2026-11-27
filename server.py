@@ -169,15 +169,12 @@ def generate_transaction_id(prefix="TX"):
 
 def generate_account_number():
 
-    while True:
+    conn = get_db()
 
-        number = str(
-            secrets.randbelow(90000000) + 10000000
-        )
+    try:
+        while True:
 
-        conn = get_db()
-
-        try:
+            number = str(secrets.randbelow(90000000) + 10000000)
 
             exists = conn.execute("""
                 SELECT 1
@@ -185,13 +182,11 @@ def generate_account_number():
                 WHERE account_number = %s
             """, (number,)).fetchone()
 
-        finally:
+            if not exists:
+                return number
 
-            conn.close()
-
-        if not exists:
-            return number
-
+    finally:
+        conn.close()
 
 def generate_api_key():
 
