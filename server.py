@@ -172,7 +172,7 @@ def generate_account_number():
     while True:
 
         number = str(
-            secrets.randbelow(900000000000) + 100000000000
+            secrets.randbelow(90000000) + 10000000
         )
 
         conn = get_db()
