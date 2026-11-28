@@ -172,21 +172,22 @@ def generate_account_number():
     conn = get_db()
 
     try:
-        while True:
+        row = conn.execute("""
+            SELECT MAX(account_number)
+            FROM accounts
+            WHERE account_number LIKE '511135%'
+        """).fetchone()
 
-            number = str(secrets.randbelow(90000000) + 10000000)
+        if row and row[0]:
+            number = str(int(row[0]) + 1)
+        else:
+            number = "51113526"
 
-            exists = conn.execute("""
-                SELECT 1
-                FROM accounts
-                WHERE account_number = %s
-            """, (number,)).fetchone()
-
-            if not exists:
-                return number
+        return number
 
     finally:
         conn.close()
+
 
 def generate_api_key():
 
