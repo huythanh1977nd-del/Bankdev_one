@@ -173,15 +173,18 @@ def generate_account_number():
 
     try:
         row = conn.execute("""
-            SELECT MAX(account_number)
+            SELECT MAX(account_number::BIGINT)
             FROM accounts
-            WHERE account_number LIKE '511135%'
+            WHERE account_number ~ '^511135[0-9]{2}$'
         """).fetchone()
 
         if row and row[0]:
             number = str(int(row[0]) + 1)
         else:
             number = "51113526"
+
+        if len(number) != 8:
+            raise ValueError("Đã vượt giới hạn số tài khoản 8 chữ số")
 
         return number
 
