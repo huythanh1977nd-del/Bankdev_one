@@ -743,15 +743,32 @@ def health():
 @app.post("/api/register")
 def register():
 
-    account_number = generate_account_number()
-
     api_key = generate_api_key()
-
     created_at = now_utc()
 
     conn = get_db()
 
     try:
+
+        # Lock bảng để tránh hai yêu cầu cấp cùng số
+        conn.execute("""
+            LOCK TABLE accounts IN EXCLUSIVE MODE
+        """)
+
+        row = conn.execute("""
+            SELECT MAX(account_number)
+            FROM accounts
+            WHERE account_number ~ '^511135[0-9]{2}$'
+        """).fetchone()
+
+        if row and row[0]:
+            account_number = str(int(row[0]) + 1)
+        else:
+            account_number = "51113526"
+
+        # Kiểm tra giới hạn 8 chữ số
+        if len(account_number) != 8:
+            raise ValueError("Account number limit reached")
 
         conn.execute("""
             INSERT INTO accounts
@@ -782,15 +799,10 @@ def register():
     return jsonify({
 
         "status": "success",
-
         "message": "Account created",
-
         "account_number": account_number,
-
         "api_key": api_key,
-
         "balance": 0,
-
         "created_at": created_at
 
     }), 201
